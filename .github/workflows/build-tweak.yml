@@ -51,14 +51,42 @@ jobs:
           cp src/JDClickerSB.plist tweak/JDClickerSB.plist
           ls -l tweak/
 
+      # theos 的 "Signing" 这一步要调用 ldid。macOS 上 install-theos 不一定带上它,
+      # 实测日志里就是 "/bin/bash: ldid: command not found" 导致构建失败。
+      # GitHub 的 macOS runner 预装了 Homebrew, 直接装一个。
+      - name: 准备 ldid (签名用)
+        run: |
+          export PATH="$THEOS/bin:$PATH"
+          if command -v ldid >/dev/null 2>&1; then
+            echo "ldid 已就位: $(command -v ldid)"
+          else
+            echo "theos 没带上 ldid, 用 Homebrew 装"
+            brew install ldid || echo "!! brew install ldid 失败"
+          fi
+          if command -v ldid >/dev/null 2>&1; then
+            echo "LDID_OK=1" >> "$GITHUB_ENV"
+            ldid -v 2>&1 | head -3 || true
+          else
+            echo "LDID_OK=0" >> "$GITHUB_ENV"
+            echo "!! 仍然没有 ldid, 构建时会跳过签名"
+          fi
+
       - name: 构建 (隐根 + 无根)
         run: |
           cd tweak
+          # 没有 ldid 时的兜底: 让 theos 把 "签名" 换成一条 echo。
+          # 隐根环境下未签名的 dylib 一样能加载 —— roothide 自己的 Bootstrap
+          # 就是 TARGET_CODESIGN = echo "don't sign"。
+          SIGN_ARG=""
+          if [ "$LDID_OK" != "1" ]; then
+            echo "!! 无 ldid, 本次用 TARGET_CODESIGN=echo 跳过签名"
+            SIGN_ARG="TARGET_CODESIGN=echo"
+          fi
           rc=0
           for scheme in roothide rootless; do
             echo "===================== scheme=$scheme ====================="
             make clean || true
-            make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=$scheme || rc=1
+            make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=$scheme $SIGN_ARG || rc=1
           done
           echo "--- 产出 ---"
           ls -l packages/ || true
