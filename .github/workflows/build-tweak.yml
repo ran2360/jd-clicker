@@ -92,22 +92,125 @@ jobs:
           ls -l packages/ || true
           exit $rc
 
+      # 校验不用 dpkg-deb: macOS runner 上没有这个命令 (它是 Debian 的工具),
+      # 实测会以 "dpkg-deb: command not found" 让整步失败。
+      # 这里用 python3 (macOS runner 自带) 直接解析 .deb 的 ar/tar 结构。
       - name: 校验产物 (切片必须有 arm64 和 arm64e; 且不应有 Depends)
         if: always()
         run: |
           cd tweak
-          shopt -s nullglob
-          for d in packages/*.deb; do
-            echo "=========== $d ==========="
-            echo "--- control ---"
-            dpkg-deb -f "$d" Package Name Version Architecture Depends || true
-            echo "--- 内容 ---"
-            dpkg-deb -c "$d" | grep -E 'dylib|plist' || true
-            tmp=$(mktemp -d)
-            dpkg-deb -x "$d" "$tmp"
-            echo "--- 切片 (必须同时有 arm64 和 arm64e) ---"
-            find "$tmp" -name '*.dylib' -exec lipo -detailed_info {} \; || true
-          done
+          echo "--- packages/ ---"
+          ls -l packages/ || true
+          python3 << 'PY'
+          import glob, io, os, struct, sys, tarfile
+
+          CPU = {0x0100000C: "arm64", 0x0200000C: "arm64_32", 0x01000007: "x86_64"}
+          SUB = {0: "ALL", 1: "V8", 2: "ARM64E"}
+
+          def arch_name(ct, cs):
+              # arm64 和 arm64e 的 **cputype 完全相同** (都是 0x0100000C),
+              # 只有 cpusubtype 不同 (0 = arm64, 2 = arm64e)。
+              # 所以架构名必须由 (cputype, cpusubtype) 共同决定 —— 只看 cputype
+              # 会把一个正确的双切片 dylib 误判成"缺 arm64e"。
+              sub = cs & 0xFFFFFF
+              if ct == 0x0100000C:
+                  return {0: "arm64", 1: "arm64v8", 2: "arm64e"}.get(sub, f"arm64.sub{sub}")
+              if ct == 0x0200000C:
+                  return "arm64_32"
+              if ct == 0x01000007:
+                  return "x86_64"
+              return f"cpu0x{ct:08X}.sub{sub}"
+
+          def ar_members(blob):
+              if not blob.startswith(b"!<arch>\n"):
+                  raise ValueError("不是 ar 归档")
+              pos, out = 8, []
+              while pos + 60 <= len(blob):
+                  hdr = blob[pos:pos + 60]
+                  name = hdr[0:16].decode("ascii", "replace").strip().rstrip("/")
+                  size = int(hdr[48:58].decode("ascii").strip())
+                  pos += 60
+                  out.append((name, blob[pos:pos + size]))
+                  pos += size + (size % 2)
+              return out
+
+          def slices(data):
+              # 注意字节序: fat 头的魔数 CAFEBABE 是**大端**的。
+              # 之前用 "<I" 读再和 0xCAFEBABE 比, 永远不相等 -> fat 分支进不去,
+              # 会把一个正确的双切片 dylib 误判成 cputype=0x02000000 (那其实是 nfat_arch)。
+              be = struct.unpack_from(">I", data, 0)[0]
+              if be == 0xCAFEBABE:                          # fat (32 位 fat_arch)
+                  n = struct.unpack_from(">I", data, 4)[0]
+                  return [struct.unpack_from(">ii", data, 8 + i * 20) for i in range(n)]
+              if be == 0xCAFEBABF:                          # fat64
+                  n = struct.unpack_from(">I", data, 4)[0]
+                  return [struct.unpack_from(">ii", data, 8 + i * 32) for i in range(n)]
+              le = struct.unpack_from("<I", data, 0)[0]
+              if le in (0xFEEDFACE, 0xFEEDFACF):            # 小端 thin (正常的 arm64/arm64e)
+                  return [struct.unpack_from("<ii", data, 4)]
+              return [struct.unpack_from(">ii", data, 4)]   # 大端 thin (理论上不出现)
+
+          def member(tf, *cands):
+              names = tf.getnames()
+              for c in cands:
+                  if c in names:
+                      return tf.extractfile(c).read()
+              return None
+
+          debs = sorted(glob.glob("packages/*.deb"))
+          if not debs:
+              print("!! packages/ 里没有 deb")
+              sys.exit(1)
+
+          ok = True
+          for deb in debs:
+              print("=" * 66)
+              print(deb)
+              mem = dict(ar_members(open(deb, "rb").read()))
+              ctrl_name = next((n for n in mem if n.startswith("control.tar")), None)
+              data_name = next((n for n in mem if n.startswith("data.tar")), None)
+              if not ctrl_name or not data_name:
+                  print(f"!! ar 成员不对: {list(mem)}")
+                  ok = False
+                  continue
+
+              with tarfile.open(fileobj=io.BytesIO(mem[ctrl_name]), mode="r:*") as tf:
+                  ctrl = (member(tf, "./control", "control") or b"").decode("utf-8", "replace")
+              print("--- control ---")
+              print(ctrl.strip())
+              deps = [l for l in ctrl.splitlines()
+                      if l.lower().startswith("depends:") and l.split(":", 1)[1].strip()]
+              if deps:
+                  print(f"!! control 里还有非空 Depends: {deps}")
+                  ok = False
+
+              with tarfile.open(fileobj=io.BytesIO(mem[data_name]), mode="r:*") as tf:
+                  dylibs = [n for n in tf.getnames() if n.endswith(".dylib")]
+                  print(f"--- data --- {dylibs}")
+                  if not dylibs:
+                      print("!! data.tar 里没有 dylib")
+                      ok = False
+                  for n in dylibs:
+                      raw = tf.extractfile(n).read()
+                      got = slices(raw)
+                      print(f"--- 切片: {n}  ({len(raw)} 字节) ---")
+                      archs = set()
+                      for ct, cs in got:
+                          name = arch_name(ct, cs)
+                          archs.add(name)
+                          sub = cs & 0xFFFFFF
+                          print(f"    cputype=0x{ct:08X} ({CPU.get(ct, '?')})"
+                                f"  cpusubtype={sub} ({SUB.get(sub, '?')})"
+                                f"  ->  {name}")
+                      missing = {"arm64", "arm64e"} - archs
+                      if missing:
+                          print(f"    !! 缺少切片: {sorted(missing)}")
+                          ok = False
+
+          print("=" * 66)
+          print("结论: " + ("切片与 control 都正确 ✓" if ok else "存在问题 ✗"))
+          sys.exit(0 if ok else 1)
+          PY
 
       - uses: actions/upload-artifact@v4
         if: always()
