@@ -1,0 +1,28 @@
+Package: com.autoclicker.jdsb
+Name: JDClickerSB
+Version: 1.0.9
+Architecture: iphoneos-arm64
+Description: 京东连点器 (SpringBoard 侧) —— 悬浮球/准星瞄准/10-30-50 次每秒; 用系统级 HID 注入触摸, 只在京东前台时显示
+Maintainer: local build
+Author: local build
+Section: Tweaks
+
+# ---------------------------------------------------------------------------
+# 关于 Depends: 这里**故意不写任何依赖**。
+#
+# 原本按惯例写的是:
+#     Depends: firmware (>= 15.0), mobilesubstrate
+# 但在隐根 Dopamine 上实测会被 Sileo 拒装:
+#     com.autoclicker.jdsb:none  Depends mobilesubstrate:none
+#     com.autoclicker.jdsb:none  Depends firmware:none(>= 15.0)
+# 也就是这台设备的 APT 索引里查不到这两个虚拟包, 于是整个安装被拦下。
+#
+# 而本插件根本不需要它们:
+#   * 不做任何 hook —— 不需要 mobilesubstrate 提供的 MSHookFunction
+#     (唯一的例外是 NoOpHide 那个诊断用的 dylib, 它才是运行期 dlsym 取, 也不靠 Depends);
+#   * 它只是被 ElleKit 加载的一个 dylib, 而 ElleKit 是越狱自带的。
+#
+# 所以依赖留空, 让包能在任何环境下装上。
+#
+# Architecture 由 theos 按 THEOS_PACKAGE_SCHEME 自动改写
+# (roothide -> iphoneos-arm64e, rootless -> iphoneos-arm64), 这里写的值会被覆盖。
