@@ -1,0 +1,18 @@
+# 千万不要推到 GitHub 的东西
+#
+# toolchain/ 里有 Zig 编译器和 iPhoneOS SDK, 一共 ~500MB ——
+# 云端构建会自己装 theos, 根本不需要这些。推上去既慢又没用。
+
+toolchain/
+dist/
+*.log
+__pycache__/
+*.pyc
+
+# theos 的构建产物
+theos/packages/
+theos/.theos/
+theos/obj/
+theos/*.dylib
+theos/JDClickerSB.m      # 由工作流从 src/ 复制进来
+theos/JDClickerSB.plist  # 同上
