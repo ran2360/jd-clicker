@@ -69,6 +69,7 @@ static NSString * const kACKeyBallX   = @"jd_ball_x";
 static NSString * const kACKeyBallY   = @"jd_ball_y";
 static NSString * const kACKeyAimed   = @"jd_aimed";
 static NSString * const kACKeyAlways  = @"jd_always_show";   // 无视前台 App 一直显示
+static NSString * const kACKeyMethod  = @"jd_method";        // 派发方式 0..3
 
 // ===========================================================================
 // MARK: - 日志 (写文件, Filza 直接可看)
@@ -152,6 +153,8 @@ typedef void (*ACEventAppendEventFn)(IOHIDEventRef, IOHIDEventRef);
 typedef void (*ACEventSetIntegerValueFn)(IOHIDEventRef, int32_t, int);
 typedef void (*ACEventSetSenderIDFn)(IOHIDEventRef, uint64_t);
 typedef IOHIDEventSystemClientRef (*ACSystemClientCreateFn)(CFAllocatorRef);
+typedef IOHIDEventSystemClientRef (*ACSystemClientCreateWithTypeFn)(CFAllocatorRef, uint32_t, CFDictionaryRef);
+typedef IOHIDEventSystemClientRef (*ACSystemClientCreateSimpleFn)(CFAllocatorRef);
 typedef void (*ACSystemClientDispatchFn)(IOHIDEventSystemClientRef, IOHIDEventRef);
 
 static ACCreateDigitizerEventFn         pCreateDigitizerEvent = NULL;
@@ -160,10 +163,35 @@ static ACEventAppendEventFn             pEventAppendEvent     = NULL;
 static ACEventSetIntegerValueFn         pEventSetIntegerValue = NULL;
 static ACEventSetSenderIDFn             pEventSetSenderID     = NULL;
 static ACSystemClientCreateFn           pSystemClientCreate   = NULL;
+static ACSystemClientCreateWithTypeFn   pClientCreateWithType = NULL;
+static ACSystemClientCreateSimpleFn     pClientCreateSimple   = NULL;
 static ACSystemClientDispatchFn         pSystemClientDispatch = NULL;
 
-// 给合成事件打一个固定的 sender id, 便于区分"我们发的"和真实触摸
+// 给合成事件打的 sender id。实测发现这可能是"事件被丢弃"的原因之一,
+// 所以它现在是可选的 —— 见 ACTouchInjector 的四种方式。
 static const uint64_t kACSyntheticSenderID = 0x8000000817319372ULL;
+
+// ---------------------------------------------------------------------------
+// 四种派发方式
+// ---------------------------------------------------------------------------
+// 为什么要有四种: 实测「开始连点」跑起来但京东毫无反应。可能性有好几个 --
+// 事件构造不对 / client 类型不对 / sender id 让系统不认 / 权限被拦。
+// 光靠猜没法区分, 所以做成可切换的, 你在菜单里一种一种试。
+typedef struct {
+    const char *name;      // 菜单上显示的短名
+    const char *detail;    // 日志里的完整说明
+    int         clientKind; // 0=Create 1=CreateWithType(Admin) 2=CreateWithType(System) 3=CreateSimpleClient
+    BOOL        useSenderID;
+} ACDispatchMethod;
+
+static const ACDispatchMethod kACMethods[] = {
+    { "1", "Create + senderID",                                 0, YES },
+    { "2", "CreateWithType(Admin=1) + senderID",                1, YES },
+    { "3", "CreateWithType(Admin=1) 不带 senderID",             1, NO  },
+    { "4", "CreateWithType(System=5) 不带 senderID",            2, NO  },
+    { "5", "CreateSimpleClient 不带 senderID",                  3, NO  },
+};
+static const int kACMethodCount = (int)(sizeof(kACMethods) / sizeof(kACMethods[0]));
 
 static void ACLoadIOHIDSymbols(void)
 {
@@ -182,19 +210,26 @@ static void ACLoadIOHIDSymbols(void)
         AC_BIND(pEventSetIntegerValue, "IOHIDEventSetIntegerValue");
         AC_BIND(pEventSetSenderID,     "IOHIDEventSetSenderID");
         AC_BIND(pSystemClientCreate,   "IOHIDEventSystemClientCreate");
+        AC_BIND(pClientCreateWithType, "IOHIDEventSystemClientCreateWithType");
+        AC_BIND(pClientCreateSimple,   "IOHIDEventSystemClientCreateSimpleClient");
         AC_BIND(pSystemClientDispatch, "IOHIDEventSystemClientDispatchEvent");
         #undef AC_BIND
-        AC_LOG(@"IOKit: digitizer=%@ finger=%@ append=%@ client=%@ dispatch=%@",
+        AC_LOG(@"IOKit 符号: digitizer=%@ finger=%@ append=%@ setInt=%@ setSender=%@",
                pCreateDigitizerEvent ? @"有" : @"无",
                pCreateFingerEvent ? @"有" : @"无",
                pEventAppendEvent ? @"有" : @"无",
+               pEventSetIntegerValue ? @"有" : @"无",
+               pEventSetSenderID ? @"有" : @"无");
+        AC_LOG(@"IOKit client: Create=%@ CreateWithType=%@ CreateSimple=%@ dispatch=%@",
                pSystemClientCreate ? @"有" : @"无",
+               pClientCreateWithType ? @"有" : @"无",
+               pClientCreateSimple ? @"有" : @"无",
                pSystemClientDispatch ? @"有" : @"无");
     });
 }
 
 // 一个 "手 + 手指" 事件; x/y 用屏幕坐标(点)
-static IOHIDEventRef ACCreateHIDEvent(CGPoint point, UITouchPhase phase)
+static IOHIDEventRef ACCreateHIDEvent(CGPoint point, UITouchPhase phase, BOOL useSenderID)
 {
     if (!pCreateDigitizerEvent || !pCreateFingerEvent) return NULL;
 
@@ -225,7 +260,7 @@ static IOHIDEventRef ACCreateHIDEvent(CGPoint point, UITouchPhase phase)
     if (!finger) { CFRelease(hand); return NULL; }
     if (pEventSetIntegerValue) pEventSetIntegerValue(finger, kACFieldDigitizerIsDisplayIntegrated, 1);
 
-    if (pEventSetSenderID) {
+    if (useSenderID && pEventSetSenderID) {
         pEventSetSenderID(hand, kACSyntheticSenderID);
         pEventSetSenderID(finger, kACSyntheticSenderID);
     }
@@ -241,6 +276,8 @@ static IOHIDEventRef ACCreateHIDEvent(CGPoint point, UITouchPhase phase)
 @interface ACTouchInjector : NSObject
 @property (nonatomic, assign, readonly) BOOL ready;
 @property (nonatomic, readonly) NSString *diagnostics;
+@property (nonatomic, readonly) NSString *clientKind;
+@property (nonatomic, assign) NSInteger methodIndex;   // 0..kACMethodCount-1
 + (instancetype)shared;
 - (void)prepare;
 - (void)tapAtPoint:(CGPoint)point;
@@ -249,6 +286,8 @@ static IOHIDEventRef ACCreateHIDEvent(CGPoint point, UITouchPhase phase)
 @implementation ACTouchInjector
 {
     IOHIDEventSystemClientRef _client;
+    NSString                 *_clientKind;
+    NSInteger                 _dispatchCount;
 }
 
 + (instancetype)shared
@@ -258,24 +297,51 @@ static IOHIDEventRef ACCreateHIDEvent(CGPoint point, UITouchPhase phase)
     return s;
 }
 
+- (NSString *)clientKind { return _clientKind ?: @"(无)"; }
+
 - (NSString *)diagnostics
 {
-    if (pSystemClientCreate == NULL)   return @"缺少 IOHIDEventSystemClientCreate";
     if (pSystemClientDispatch == NULL) return @"缺少 IOHIDEventSystemClientDispatchEvent";
     if (pCreateDigitizerEvent == NULL || pCreateFingerEvent == NULL) return @"缺少 IOHID 事件构造符号";
-    if (_client == NULL)               return @"IOHIDEventSystemClient 创建失败";
-    return @"已就绪";
+    if (_client == NULL) return [NSString stringWithFormat:@"client 创建失败 (%@)", self.clientKind];
+    return [NSString stringWithFormat:@"已就绪 / %@", self.clientKind];
+}
+
+// 按当前 methodIndex 建一个 client。四种方式见 kACMethods 的表。
+- (void)buildClient
+{
+    ACLoadIOHIDSymbols();
+    _client = NULL;
+    int kind = kACMethods[MAX(0, MIN(_methodIndex, kACMethodCount - 1))].clientKind;
+
+    if (kind == 0 && pSystemClientCreate) {
+        _client = pSystemClientCreate(kCFAllocatorDefault);
+    } else if (kind == 1 && pClientCreateWithType) {
+        _client = pClientCreateWithType(kCFAllocatorDefault, 1 /* Admin */, NULL);
+    } else if (kind == 2 && pClientCreateWithType) {
+        _client = pClientCreateWithType(kCFAllocatorDefault, 5 /* System */, NULL);
+    } else if (kind == 3 && pClientCreateSimple) {
+        _client = pClientCreateSimple(kCFAllocatorDefault);
+    }
+    // 该方式需要的符号不存在时, 退回到最基础的 Create, 免得完全不能用
+    if (_client == NULL && pSystemClientCreate) {
+        _client = pSystemClientCreate(kCFAllocatorDefault);
+        _clientKind = [NSString stringWithFormat:@"方式%ld 的符号缺失, 回退到 Create",
+                       (long)_methodIndex + 1];
+    } else {
+        _clientKind = [NSString stringWithFormat:@"方式%ld: %s",
+                       (long)_methodIndex + 1, kACMethods[MAX(0, MIN(_methodIndex, kACMethodCount - 1))].detail];
+    }
+
+    BOOL ok = self.ready;
+    AC_LOG(@"注入器: ready=%@  方式%ld  ->  %@",
+           ok ? @"YES" : @"NO", (long)_methodIndex + 1, _clientKind);
 }
 
 - (void)prepare
 {
-    ACLoadIOHIDSymbols();
-    if (_client == NULL && pSystemClientCreate) {
-        _client = pSystemClientCreate(kCFAllocatorDefault);
-    }
-    BOOL ok = (_client != NULL && pSystemClientDispatch != NULL &&
-               pCreateDigitizerEvent != NULL && pCreateFingerEvent != NULL);
-    AC_LOG(@"注入器: ready=%@ (%@)", ok ? @"YES" : @"NO", self.diagnostics);
+    [self buildClient];
+    _dispatchCount = 0;
 }
 
 - (BOOL)ready
@@ -287,11 +353,35 @@ static IOHIDEventRef ACCreateHIDEvent(CGPoint point, UITouchPhase phase)
 - (void)tapAtPoint:(CGPoint)point
 {
     if (!self.ready) return;
+
+    BOOL useSender = kACMethods[MAX(0, MIN(_methodIndex, kACMethodCount - 1))].useSenderID;
+    _dispatchCount++;
+
     @try {
-        IOHIDEventRef down = ACCreateHIDEvent(point, UITouchPhaseBegan);
-        if (down) { pSystemClientDispatch(_client, down); CFRelease(down); }
-        IOHIDEventRef up = ACCreateHIDEvent(point, UITouchPhaseEnded);
-        if (up) { pSystemClientDispatch(_client, up); CFRelease(up); }
+        IOHIDEventRef down = ACCreateHIDEvent(point, UITouchPhaseBegan, useSender);
+        IOHIDEventRef up   = ACCreateHIDEvent(point, UITouchPhaseEnded, useSender);
+
+        if (_dispatchCount <= 4) {
+            // 头几次把细节全打出来, 方便判断"事件构造失败"还是"派发无效"
+            UIScreen *sc = [UIScreen mainScreen];
+            AC_LOG(@"派发 #%ld: 点=(%.0f, %.0f) 缩放=%.1f (像素=(%.0f, %.0f)) senderID=%@ down=%@ up=%@ client=%@",
+                   (long)_dispatchCount, point.x, point.y, sc.scale,
+                   point.x * sc.scale, point.y * sc.scale,
+                   useSender ? @"带" : @"不带",
+                   down ? @"建好" : @"失败", up ? @"建好" : @"失败",
+                   self.clientKind);
+        }
+        if (!down || !up) {
+            if (_dispatchCount <= 4) AC_LOG(@"!! IOHID 事件构造失败, 无法派发");
+            if (down) CFRelease(down);
+            if (up) CFRelease(up);
+            return;
+        }
+
+        pSystemClientDispatch(_client, down);
+        pSystemClientDispatch(_client, up);
+        CFRelease(down);
+        CFRelease(up);
     } @catch (NSException *ex) {
         AC_LOG(@"派发异常: %@ - %@", ex.name, ex.reason);
     }
@@ -385,6 +475,59 @@ static id ACKVC(id obj, NSString *key)
     @try { return [obj valueForKey:key]; } @catch (NSException *e) { return nil; }
 }
 
+#pragma mark - 权限自检
+
+// ★ 这一步是关键怀疑的定性手段 ★
+//
+// 系统级 HID 触摸派发需要进程有 com.apple.private.hid.client.event-dispatch
+// 这个 entitlement。backboardd 肯定有 (它本身就是 HID 事件系统), 但
+// **SpringBoard 有没有, 我并不确定** —— 而实测"桌面图标也点不动"说明派发完全没生效,
+// 权限不足是最可能的原因之一。
+//
+// SecTaskCreateFromSelf 能直接读出本进程代码签名里的 entitlements, 所以不用猜。
+static void ACProbeOwnEntitlements(void)
+{
+    typedef struct __SecTask *ACSecTaskRef;
+    typedef ACSecTaskRef (*ACSecTaskCreateFromSelfFn)(CFAllocatorRef);
+    typedef CFTypeRef (*ACSecTaskCopyValueFn)(ACSecTaskRef, CFStringRef, CFErrorRef *);
+
+    // 用 dlsym 取, 免得为了这两个私有 API 去链接 Security.framework
+    ACSecTaskCreateFromSelfFn create =
+        (ACSecTaskCreateFromSelfFn)dlsym(RTLD_DEFAULT, "SecTaskCreateFromSelf");
+    ACSecTaskCopyValueFn copy =
+        (ACSecTaskCopyValueFn)dlsym(RTLD_DEFAULT, "SecTaskCopyValueForEntitlement");
+    if (!create || !copy) {
+        AC_LOG(@"权限自检: 拿不到 SecTask API, 跳过");
+        return;
+    }
+    ACSecTaskRef task = create(kCFAllocatorDefault);
+    if (!task) { AC_LOG(@"权限自检: SecTaskCreateFromSelf 返回空"); return; }
+
+    static const char *keys[] = {
+        "com.apple.private.hid.client.event-dispatch",
+        "com.apple.private.hid.client.event-filter",
+        "com.apple.private.hid.client.event-monitor",
+        "platform-application",
+        "com.apple.private.security.no-sandbox",
+        "com.apple.private.security.storage.AppDataContainers",
+        NULL
+    };
+
+    AC_LOG(@"---------- 本进程权限自检 (当前进程 = SpringBoard) ----------");
+    for (int i = 0; keys[i] != NULL; i++) {
+        CFStringRef k = CFStringCreateWithCString(kCFAllocatorDefault, keys[i],
+                                                  kCFStringEncodingUTF8);
+        CFTypeRef v = copy(task, k, NULL);
+        AC_LOG(@"  %-52s : %@", keys[i], v ? @"有" : @"无");
+        if (v) CFRelease(v);
+        CFRelease(k);
+    }
+    AC_LOG(@"  ↑ 如果 hid.client.event-dispatch 是「无」, 那就是派发不生效的根因:");
+    AC_LOG(@"    SpringBoard 沙箱不允许, 需要把派发放到 backboardd 侧去做。");
+    AC_LOG(@"--------------------------------------------------------------");
+    CFRelease(task);
+}
+
 #pragma mark - 诊断: 把能找到的东西全打出来
 
 // 列出某个类上所有名字包含 needle 的方法 —— 这是找对 selector 名最直接的办法。
@@ -414,9 +557,34 @@ static NSArray *ACAllSBApplications(id ctrl)
     return all;
 }
 
-// 这是本版重点: 一次把"前台检测到底能不能用、该用哪个 selector"查清楚。
+// 列出当前所有"正在运行"的应用及其 processState。
+// 目的: 我们还不确定 processState 的哪个数值对应"前台" —— 让用户开一次京东,
+// 日志里就能直接看到那个值。(日志第 37 行拿到 0, 是因为诊断跑在京东还没启动时。)
+static void ACDumpRunningApps(void)
+{
+    id ctrl = ACSharedInstanceOf(@"SBApplicationController");
+    if (!ctrl) return;
+    NSArray *all = ACAllSBApplications(ctrl);
+    if (!all) return;
+
+    NSMutableArray *lines = [NSMutableArray array];
+    for (id a in all) {
+        BOOL ok = NO;
+        NSInteger st = ACCallInt(a, @"processState", &ok);
+        if (!ok || st == 0) continue;                 // 只列非 0 的
+        id bid = ACCallObj(a, @"bundleIdentifier");
+        [lines addObject:[NSString stringWithFormat:@"%@=%ld", bid ?: @"?", (long)st]];
+    }
+    if (lines.count == 0) {
+        AC_LOG(@"当前没有 processState 非 0 的应用");
+    } else {
+        AC_LOG(@"正在运行的应用 (bundleId=processState): %@",
+               [lines componentsJoinedByString:@", "]);
+    }
+}
 static void ACDumpForegroundDiagnostics(void)
 {
+    ACProbeOwnEntitlements();          // ★ 先查权限, 这是"派发不生效"的头号嫌疑
     AC_LOG(@"========== 前台检测诊断 (开始) ==========");
 
     Class ctrlC = NSClassFromString(@"SBApplicationController");
@@ -681,6 +849,7 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
     UIButton            *_startBtn;
     UISegmentedControl  *_freqCtrl;
     UISegmentedControl  *_showCtrl;
+    UISegmentedControl  *_methodCtrl;
     UILabel             *_statusLabel;
     ACCrosshairView     *_crosshair;
 
@@ -689,12 +858,14 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
     BOOL                 _hasPoint;
     NSInteger            _freqIndex;
     BOOL                 _alwaysShow;
+    NSInteger            _methodIndex;
     BOOL                 _targetFront;
     NSTimer             *_visTimer;
     NSInteger            _installRetry;
     NSInteger            _blindTicks;      // 选了「仅京东显示」但一直检测不到前台的累计次数
     BOOL                 _reportedUnknown; // 是否已经把"检测不可用"打进日志
     NSInteger            _tickCount;
+    NSInteger            _lastTargetState; // 京东 processState 的上一个值 (用来发现变化)
 }
 
 + (instancetype)shared
@@ -713,6 +884,7 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
 
     AC_LOG(@"bootstrap: 日志文件 = %@", ACLogFilePath() ?: @"(写不进去)");
 
+    _lastTargetState = NSIntegerMin;    // 保证第一次读到就记一条变化
     [self loadPrefs];
     [[ACTouchInjector shared] prepare];
 
@@ -812,6 +984,22 @@ static UIWindowScene *ACAnyWindowScene(void)
     BOOL front = (probe == ACFrontProbeYes);
     BOOL shouldShow = _alwaysShow || front;
 
+    // 记录京东 processState 的变化 —— 我们还不确定"前台"是哪个数值。
+    // 你只要开着京东待一会儿, 日志里就会出现它的真实值, 那就能把判定改对。
+    {
+        id app = ACTargetSBApplication();
+        if (app) {
+            BOOL ok = NO;
+            NSInteger st = ACCallInt(app, @"processState", &ok);
+            if (ok && st != _lastTargetState) {
+                AC_LOG(@"★ %@ 的 processState 变化: %ld -> %ld",
+                       kJDTargetName, (long)_lastTargetState, (long)st);
+                _lastTargetState = st;
+                ACDumpRunningApps();
+            }
+        }
+    }
+
     if (front != _targetFront) {
         _targetFront = front;
         AC_LOG(@"%@ 前后台状态: %@ (检测结果=%@)", kJDTargetName,
@@ -909,7 +1097,7 @@ static UIWindowScene *ACAnyWindowScene(void)
 - (void)buildMenu
 {
     CGFloat w = kACMenuWidth;
-    CGFloat h = 10 + 40 + 6 + 40 + 6 + 32 + 6 + 32 + 6 + 62 + 10;   // 250
+    CGFloat h = 10 + 40 + 6 + 40 + 6 + 32 + 6 + 32 + 6 + 32 + 6 + 78 + 10;   // 304
 
     _menu = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, h)];
     _menu.backgroundColor = [UIColor colorWithWhite:0.12 alpha:0.94];
@@ -944,8 +1132,22 @@ static UIWindowScene *ACAnyWindowScene(void)
     [_showCtrl addTarget:self action:@selector(onShowChanged:) forControlEvents:UIControlEventValueChanged];
     [_menu addSubview:_showCtrl];
 
-    _statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 178, w - 24, 62)];
-    _statusLabel.numberOfLines = 5;
+    // 派发方式: 用来试出哪种 IOHID client / 是否带 senderID 才能真正打到京东
+    NSMutableArray *names = [NSMutableArray array];
+    for (int i = 0; i < kACMethodCount; i++) {
+        [names addObject:[NSString stringWithUTF8String:kACMethods[i].name]];
+    }
+    _methodCtrl = [[UISegmentedControl alloc] initWithItems:names];
+    _methodCtrl.frame = CGRectMake(10, 178, w - 20, 32);
+    _methodCtrl.selectedSegmentIndex = _methodIndex;
+    if (@available(iOS 13.0, *)) {
+        _methodCtrl.selectedSegmentTintColor = [UIColor colorWithRed:0.92 green:0.42 blue:0.16 alpha:1.0];
+    }
+    [_methodCtrl addTarget:self action:@selector(onMethodChanged:) forControlEvents:UIControlEventValueChanged];
+    [_menu addSubview:_methodCtrl];
+
+    _statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 216, w - 24, 78)];
+    _statusLabel.numberOfLines = 6;
     _statusLabel.font = [UIFont systemFontOfSize:9.5];
     _statusLabel.textColor = [UIColor colorWithWhite:0.85 alpha:1.0];
     [_menu addSubview:_statusLabel];
@@ -1003,6 +1205,9 @@ static UIWindowScene *ACAnyWindowScene(void)
     // 所以先让它一定能看见, 用户确认检测灵了之后再自己切成「仅京东显示」。
     id alwaysPref = [d objectForKey:kACKeyAlways];
     _alwaysShow = (alwaysPref == nil) ? YES : [d boolForKey:kACKeyAlways];
+
+    _methodIndex = [d integerForKey:kACKeyMethod];      // 默认 0 = 方式1
+    if (_methodIndex < 0 || _methodIndex >= kACMethodCount) _methodIndex = 0;
 }
 
 - (void)savePoint
@@ -1139,9 +1344,41 @@ static UIWindowScene *ACAnyWindowScene(void)
         AC_LOG(@"悬浮球遮挡了点击点, 已自动移动到 (%.0f, %.0f)", safe.x, safe.y);
     }
 
+    // ★ 关键诊断: 检查点击点是不是被我们自己的悬浮层挡住了。
+    //   系统级 HID 事件是按坐标投递的, 而我们的窗口是全屏的、层级 3000。
+    //   如果这个坐标被自己的视图命中, 触摸就会被我们吃掉, 打不到京东。
+    UIView *hit = [_window hitTest:_point withEvent:nil];
+    if (hit) {
+        AC_LOG(@"!! 点击点 (%.0f, %.0f) 被自己的悬浮层挡住了: %@",
+               _point.x, _point.y, NSStringFromClass([hit class]));
+        AC_LOG(@"!! 触摸会打在这个视图上而不是京东 —— 请把准星移到没有被球/菜单覆盖的位置。");
+    } else {
+        AC_LOG(@"点击点 (%.0f, %.0f) 未被悬浮层命中 (hitTest=nil, 触摸可以穿过)",
+               _point.x, _point.y);
+    }
+
     eng.point = _point;
     eng.frequency = [self currentFrequency];
     [eng start];
+    [self refreshUI];
+}
+
+- (void)onMethodChanged:(UISegmentedControl *)c
+{
+    _methodIndex = c.selectedSegmentIndex;
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    [d setInteger:_methodIndex forKey:kACKeyMethod];
+    [d synchronize];
+
+    ACClickEngine *eng = [ACClickEngine shared];
+    BOOL wasRunning = eng.running;
+    if (wasRunning) [eng stop];
+
+    [[ACTouchInjector shared] prepare];      // 按新方式重建 client
+    AC_LOG(@"切换派发方式 -> 方式%ld", (long)_methodIndex + 1);
+    AC_LOG(@"  提示: 换方式后请到 SpringBoard 桌面把准星对准一个 App 图标试点击 ——");
+    AC_LOG(@"  那里能最直接地看出 HID 派发到底通不通 (图标被点开 = 通了)。");
+    if (wasRunning) [eng start];
     [self refreshUI];
 }
 
@@ -1205,14 +1442,16 @@ static UIWindowScene *ACAnyWindowScene(void)
 
     _freqCtrl.selectedSegmentIndex = _freqIndex;
     _showCtrl.selectedSegmentIndex = _alwaysShow ? 1 : 0;
+    _methodCtrl.selectedSegmentIndex = _methodIndex;
 
     _statusLabel.text = [NSString stringWithFormat:
-        @"坐标 %.0f, %.0f %@ | 频率 %.0f/s\n状态: %@\n%@: %@\nHID: %@",
+        @"坐标 %.0f, %.0f %@ | 频率 %.0f/s\n状态: %@\n%@: %@\n派发: %@\nHID: %@",
         _point.x, _point.y,
         _hasPoint ? @"" : @"(未保存)",
         [self currentFrequency],
         running ? @"连点中" : (_aiming ? @"瞄准中" : @"待机"),
         kJDTargetName, _targetFront ? @"前台" : @"不在前台",
+        inj.clientKind,
         inj.diagnostics ?: @"?"];
 }
 
