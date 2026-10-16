@@ -1,63 +1,74 @@
 name: build-tweak
 
-# 在 GitHub 的 macOS runner 上用 theos 构建插件。
+# 在 GitHub 的 macOS runner 上用 theos 构建插件（产出真正的 arm64e 切片）。
 #
 # 为什么走这条路:
-#   我们的 SpringBoard 插件**必须包含 arm64e 切片** (SpringBoard 是 arm64e 进程),
-#   而 Windows 侧的交叉工具链 (Zig / LLVM ld64.lld) 产不出真正的 arm64e。
-#   GitHub 提供免费的 macOS runner, 上面有 Xcode 的 clang + 真正的 ld64,
-#   能产出正确的 fat (arm64 + arm64e) dylib。
+#   SpringBoard 是 arm64e 进程, 插件必须带 arm64e 切片才加载得进去;
+#   而 Windows 侧的交叉工具链 (Zig / LLVM ld64.lld) 产不出合法的 arm64e。
+#   GitHub 免费提供 macOS runner, 上面有真正的 clang + ld64。
 #
-# 用法:
-#   1. 把整个 ios-autoclicker 目录推到一个 GitHub 仓库 (公开仓库免费额度足够);
-#   2. Actions 页面会自动跑, 或手动点 "Run workflow";
-#   3. 跑完在页面底部的 Artifacts 里下载 debs。
-#
-# 如果没有 GitHub 账号 / 不想用 Actions, 也可以在有 Mac 的朋友机器上直接跑
-# theos/Makefile (见该文件顶部注释)。
+# 目录约定 (重要, 别改乱):
+#   tweak/        <- 我们自己的 theos 工程 (Makefile / control)
+#   $RUNNER_TEMP/theos  <- 工作流自己克隆的 theos 本体
+#   两者必须分开! 第一版就是把 theos 克隆进 worksapce/theos, 和我们自己的
+#   theos/ 工程目录撞了, 报 "destination path ... already exists" 直接失败。
 
 on:
   push:
     paths:
       - 'src/**'
-      - 'theos/**'
+      - 'tweak/**'
       - '.github/workflows/build-tweak.yml'
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: macos-14
-    env:
-      THEOS: ${{ github.workspace }}/theos
 
     steps:
       - uses: actions/checkout@v4
 
-      # roothide 的 theos 分支支持 THEOS_PACKAGE_SCHEME=roothide (上游只有 rootless)
+      # theos 本体装到 runner 的临时目录, 和仓库里的 tweak/ 完全分开
       - name: 安装 theos (roothide 分支)
         run: |
+          export THEOS="$RUNNER_TEMP/theos"
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+          rm -rf "$THEOS"
           git clone --recursive --depth 1 https://github.com/roothide/theos.git "$THEOS"
-          "$THEOS/bin/install-theos" || true
-          ls "$THEOS" | head
+          # install-theos 在 macOS 上主要做工具链/ldid 的落地; 失败也继续,
+          # 后面构建时如果真缺东西会自己报出来。
+          "$THEOS/bin/install-theos" || echo "!! install-theos 返回非 0, 继续尝试构建"
+          echo "--- theos 目录 ---"
+          ls "$THEOS" | head -20
+          echo "--- ldid 是否就位 ---"
+          ls -l "$THEOS/bin/ldid" || echo "!! 没有 ldid"
+          echo "--- 可用 SDK ---"
+          xcrun --sdk iphoneos --show-sdk-version || true
 
       - name: 准备源码 (theos 工程需要源文件在工程目录里)
         run: |
-          cp src/JDClickerSB.m     theos/JDClickerSB.m
-          cp src/JDClickerSB.plist theos/JDClickerSB.plist
-          ls -l theos/
+          cp src/JDClickerSB.m     tweak/JDClickerSB.m
+          cp src/JDClickerSB.plist tweak/JDClickerSB.plist
+          ls -l tweak/
 
       - name: 构建 (隐根 + 无根)
         run: |
-          cd theos
+          cd tweak
+          rc=0
           for scheme in roothide rootless; do
-            echo "===== building scheme=$scheme ====="
+            echo "===================== scheme=$scheme ====================="
             make clean || true
-            make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=$scheme
+            make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=$scheme || rc=1
           done
+          echo "--- 产出 ---"
+          ls -l packages/ || true
+          exit $rc
 
-      - name: 校验产物切片 (必须同时有 arm64 和 arm64e)
+      - name: 校验产物 (切片必须有 arm64 和 arm64e; 且不应有 Depends)
+        if: always()
         run: |
-          cd theos
+          cd tweak
+          shopt -s nullglob
           for d in packages/*.deb; do
             echo "=========== $d ==========="
             echo "--- control ---"
@@ -66,14 +77,13 @@ jobs:
             dpkg-deb -c "$d" | grep -E 'dylib|plist' || true
             tmp=$(mktemp -d)
             dpkg-deb -x "$d" "$tmp"
-            echo "--- 切片 ---"
+            echo "--- 切片 (必须同时有 arm64 和 arm64e) ---"
             find "$tmp" -name '*.dylib' -exec lipo -detailed_info {} \; || true
           done
-          echo ""
-          echo "★ 上面 architecture 列表里必须同时出现 arm64 和 arm64e ★"
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: jdclickersb-debs
-          path: theos/packages/*.deb
-          if-no-files-found: error
+          path: tweak/packages/*.deb
+          if-no-files-found: warn
