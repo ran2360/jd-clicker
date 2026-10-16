@@ -1,0 +1,79 @@
+name: build-tweak
+
+# 在 GitHub 的 macOS runner 上用 theos 构建插件。
+#
+# 为什么走这条路:
+#   我们的 SpringBoard 插件**必须包含 arm64e 切片** (SpringBoard 是 arm64e 进程),
+#   而 Windows 侧的交叉工具链 (Zig / LLVM ld64.lld) 产不出真正的 arm64e。
+#   GitHub 提供免费的 macOS runner, 上面有 Xcode 的 clang + 真正的 ld64,
+#   能产出正确的 fat (arm64 + arm64e) dylib。
+#
+# 用法:
+#   1. 把整个 ios-autoclicker 目录推到一个 GitHub 仓库 (公开仓库免费额度足够);
+#   2. Actions 页面会自动跑, 或手动点 "Run workflow";
+#   3. 跑完在页面底部的 Artifacts 里下载 debs。
+#
+# 如果没有 GitHub 账号 / 不想用 Actions, 也可以在有 Mac 的朋友机器上直接跑
+# theos/Makefile (见该文件顶部注释)。
+
+on:
+  push:
+    paths:
+      - 'src/**'
+      - 'theos/**'
+      - '.github/workflows/build-tweak.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    env:
+      THEOS: ${{ github.workspace }}/theos
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # roothide 的 theos 分支支持 THEOS_PACKAGE_SCHEME=roothide (上游只有 rootless)
+      - name: 安装 theos (roothide 分支)
+        run: |
+          git clone --recursive --depth 1 https://github.com/roothide/theos.git "$THEOS"
+          "$THEOS/bin/install-theos" || true
+          ls "$THEOS" | head
+
+      - name: 准备源码 (theos 工程需要源文件在工程目录里)
+        run: |
+          cp src/JDClickerSB.m     theos/JDClickerSB.m
+          cp src/JDClickerSB.plist theos/JDClickerSB.plist
+          ls -l theos/
+
+      - name: 构建 (隐根 + 无根)
+        run: |
+          cd theos
+          for scheme in roothide rootless; do
+            echo "===== building scheme=$scheme ====="
+            make clean || true
+            make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=$scheme
+          done
+
+      - name: 校验产物切片 (必须同时有 arm64 和 arm64e)
+        run: |
+          cd theos
+          for d in packages/*.deb; do
+            echo "=========== $d ==========="
+            echo "--- control ---"
+            dpkg-deb -f "$d" Package Name Version Architecture Depends || true
+            echo "--- 内容 ---"
+            dpkg-deb -c "$d" | grep -E 'dylib|plist' || true
+            tmp=$(mktemp -d)
+            dpkg-deb -x "$d" "$tmp"
+            echo "--- 切片 ---"
+            find "$tmp" -name '*.dylib' -exec lipo -detailed_info {} \; || true
+          done
+          echo ""
+          echo "★ 上面 architecture 列表里必须同时出现 arm64 和 arm64e ★"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jdclickersb-debs
+          path: theos/packages/*.deb
+          if-no-files-found: error
