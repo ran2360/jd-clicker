@@ -45,11 +45,21 @@ jobs:
           echo "--- 可用 SDK ---"
           xcrun --sdk iphoneos --show-sdk-version || true
 
+      # 自动写版本号, 这样以后**只需要替换 src/JDClickerSB.m 一个文件**,
+      # 不用再手动改 tweak/control (改版本号这件事最容易漏, 漏了就会装到旧包)。
+      # 用 run_number 保证严格递增; 加 2000 的基数是为了永远大于早期手动版本号。
       - name: 准备源码 (theos 工程需要源文件在工程目录里)
         run: |
           cp src/JDClickerSB.m     tweak/JDClickerSB.m
           cp src/JDClickerSB.plist tweak/JDClickerSB.plist
-          ls -l tweak/
+          VER="1.0.$((2000 + ${{ github.run_number }}))"
+          sed -i '' "s/^Version:.*/Version: $VER/" tweak/control
+          echo "本次构建版本号: $VER  (来自 run_number ${{ github.run_number }})"
+          echo "--- tweak/control ---"
+          cat tweak/control
+          echo "--- 源码 ---"
+          ls -l tweak/JDClickerSB.m
+          shasum -a 256 src/JDClickerSB.m | tee hash.txt
 
       # theos 的 "Signing" 这一步要调用 ldid。macOS 上 install-theos 不一定带上它,
       # 实测日志里就是 "/bin/bash: ldid: command not found" 导致构建失败。
