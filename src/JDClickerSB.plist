@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	    JDClickerSB —— 注入 SpringBoard 的京东连点器。
+
+	    注意这里的 filter 是 **SpringBoard**, 不是京东。
+
+	    为什么不注入京东:
+	        实测确认京东会杀死任何进程内出现外来 dylib 的自身实例 ——
+	        连一个只打两条 NSLog 的 NoOp.dylib 都会让它崩, 而且接管 dyld 的
+	        公开镜像枚举 API 也瞒不过它。详见 README §6.9。
+
+	    本插件因此完全不碰京东进程: 悬浮窗建在 SpringBoard 里, 触摸用系统级
+	    HID 事件从外面打进京东; 并且只在京东位于前台时显示悬浮球。
+
+	    com.apple.springboard
+	-->
+	<key>Filter</key>
+	<dict>
+		<key>Bundles</key>
+		<array>
+			<string>com.apple.springboard</string>
+		</array>
+	</dict>
+</dict>
+</plist>
