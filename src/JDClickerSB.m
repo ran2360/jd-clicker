@@ -443,13 +443,6 @@ static id ACSharedInstanceOf(NSString *cls)
     return ((id (*)(id, SEL))objc_msgSend)(c, s);
 }
 
-static id ACCallObj(id obj, NSString *sel)
-{
-    SEL s = NSSelectorFromString(sel);
-    if (!obj || ![obj respondsToSelector:s]) return nil;
-    return ((id (*)(id, SEL))objc_msgSend)(obj, s);
-}
-
 static id ACCallObj1(id obj, NSString *sel, id arg)
 {
     SEL s = NSSelectorFromString(sel);
