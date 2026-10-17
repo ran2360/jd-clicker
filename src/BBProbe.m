@@ -28,7 +28,7 @@
 //
 
 #import <Foundation/Foundation.h>
-#import <UIKit/UIKit.h>
+#import <CoreGraphics/CoreGraphics.h>
 #include <dlfcn.h>
 #include <mach/mach_time.h>
 #include <unistd.h>
@@ -226,11 +226,13 @@ static void BBProbeEntitlements(void)
 // 所以这一轮把两种单位各测一遍, 一次性定性。
 static CGFloat BBScreenScale(void)
 {
-    @try {
-        CGFloat s = [UIScreen mainScreen].scale;
-        if (s > 0) return s;
-    } @catch (NSException *e) { }
-    return 3.0;                      // iPhone 14 Pro Max
+    // ★ 血泪教训 ★
+    // 1.0.2020 在这里调了 [UIScreen mainScreen].scale, 结果 backboardd 直接黑屏:
+    //   backboardd 不是 UIKit 应用, 在它的进程里 (尤其 dyld 初始化阶段) 碰 UIKit
+    //   是致命的。所以这里完全绕开 UIKit, 直接写死缩放值。
+    //
+    // iPhone 14 Pro Max 是 @3x, 而本探针只在固定设备上做诊断, 写死最安全。
+    return 3.0;
 }
 
 static CGPoint BBScaled(CGPoint p, BOOL pixels, CGFloat scale)
@@ -287,16 +289,40 @@ static void BBSwipe(IOHIDEventSystemClientRef c, CGPoint from, CGPoint to, int s
 // ---------------------------------------------------------------------------
 // 入口
 // ---------------------------------------------------------------------------
+// ★ 安全约定 (1.0.2020 黑屏的教训) ★
+//   1. 构造函数里**只做打日志**, 其它一切 (IOKit、权限自检、派发) 都推迟到启动后;
+//   2. **完全不碰 UIKit** (backboardd 不是 UIKit 应用, 碰了就黑屏);
+//   3. 全程 @try/@catch, 任何异常都不能从 backboardd 的线程里冒出去。
+// 真正的探针逻辑, 全部在启动 1 秒后才执行
+static void BBRun(void);
+
 __attribute__((constructor))
 static void BBProbeInit(void)
 {
-    BBLog(@"==================================================");
-    BBLog(@"constructor 执行了 —— ElleKit 确实把 dylib 注入了 backboardd");
+    @try {
+        BBLog(@"constructor 执行了 —— ElleKit 确实把 dylib 注入了 backboardd");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @autoreleasepool {
+                @try {
+                    BBRun();
+                } @catch (NSException *e) {
+                    BBLog(@"!! 派发阶段异常 (已被捕获): %@ - %@", e.name, e.reason);
+                }
+            }
+        });
+    } @catch (NSException *e) {
+        // 构造函数里绝不把异常抛回 dyld —— 否则 backboardd 会崩
+    }
+}
+
+// 真正的探针逻辑, 全部在启动 1 秒后才执行
+static void BBRun(void)
+{
     BBLog(@"进程名: %@   bundleId: %@",
           [[NSProcessInfo processInfo] processName] ?: @"?",
           [[NSBundle mainBundle] bundleIdentifier] ?: @"?");
     BBLog(@"日志文件: %@", BBLogPath() ?: @"(写不进去)");
-    BBLog(@"==================================================");
 
     BBLoadSymbols();
     BBProbeEntitlements();
@@ -312,10 +338,6 @@ static void BBProbeInit(void)
     //   第 2 轮 点 Dock 图标 · 单位=像素   <- 如果只有这轮有反应, 说明坐标要用像素
     //   第 3 轮 顶部下滑   · 单位=点
     //   第 4 轮 顶部下滑   · 单位=像素
-    //
-    // 用"点 Dock 图标"(会开 App) 和"顶部下滑"(会拉通知中心) 当作判据, 是因为
-    // 它们的结果肉眼必然可见、而且事后还能查。上一版用"点屏幕中心"完全无效 ——
-    // 桌面中心本来就是空白, 点一下就什么都不会发生, 那个结论毫无意义。
     for (int round = 0; round < 4; round++) {
         BOOL pixels = (round % 2) == 1;         // 1、3 轮用像素
         BOOL dockTap = (round < 2);             // 前两轮点 Dock, 后两轮下滑
@@ -323,25 +345,29 @@ static void BBProbeInit(void)
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((20 + round * 20) * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             @autoreleasepool {
-                IOHIDEventSystemClientRef c = BBMakeClient(2);      // System(5)
-                BBLog(@"---------- 第 %d 轮  坐标单位=%@ ----------",
-                      round + 1, pixels ? @"像素" : @"点");
-                BBLog(@"client = %@", c ? @"建好" : @"失败");
-                if (!c) return;
+                @try {
+                    IOHIDEventSystemClientRef c = BBMakeClient(2);      // System(5)
+                    BBLog(@"---------- 第 %d 轮  坐标单位=%@ ----------",
+                          round + 1, pixels ? @"像素" : @"点");
+                    BBLog(@"client = %@", c ? @"建好" : @"失败");
+                    if (!c) return;
 
-                if (dockTap) {
-                    CGPoint p = BBScaled(CGPointMake(55, 850), pixels, scale);
-                    BBLog(@"动作: 点 (%.0f, %.0f) 三次 —— 成功的话应该会打开 Dock 第一个 App",
-                          p.x, p.y);
-                    BBTap(c, p, 3);
-                    BBLog(@"已派发。★ 有 App 自己打开吗?");
-                } else {
-                    CGPoint from = BBScaled(CGPointMake(215, 3), pixels, scale);
-                    CGPoint to   = BBScaled(CGPointMake(215, 620), pixels, scale);
-                    BBLog(@"动作: 从 (%.0f, %.0f) 滑到 (%.0f, %.0f) —— 成功的话应该拉出通知中心",
-                          from.x, from.y, to.x, to.y);
-                    BBSwipe(c, from, to, 30);
-                    BBLog(@"已派发。★ 通知中心被拉出来了吗? (它会一直留着)");
+                    if (dockTap) {
+                        CGPoint p = BBScaled(CGPointMake(55, 850), pixels, scale);
+                        BBLog(@"动作: 点 (%.0f, %.0f) 三次 —— 成功的话应该会打开 Dock 第一个 App",
+                              p.x, p.y);
+                        BBTap(c, p, 3);
+                        BBLog(@"已派发。★ 有 App 自己打开吗?");
+                    } else {
+                        CGPoint from = BBScaled(CGPointMake(215, 3), pixels, scale);
+                        CGPoint to   = BBScaled(CGPointMake(215, 620), pixels, scale);
+                        BBLog(@"动作: 从 (%.0f, %.0f) 滑到 (%.0f, %.0f) —— 成功的话应该拉出通知中心",
+                              from.x, from.y, to.x, to.y);
+                        BBSwipe(c, from, to, 30);
+                        BBLog(@"已派发。★ 通知中心被拉出来了吗? (它会一直留着)");
+                    }
+                } @catch (NSException *e) {
+                    BBLog(@"!! 第 %d 轮异常 (已捕获): %@ - %@", round + 1, e.name, e.reason);
                 }
             }
         });
