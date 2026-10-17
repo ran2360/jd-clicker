@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	    BBProbe —— 注入 backboardd 的探针。
+
+	    backboardd 本身就是 iOS 的 HID 事件系统, 不受应用沙箱约束, 所以
+	    "在 backboardd 里派发触摸" 是绕开 SpringBoard 沙箱的已知可行做法
+	    (ZXTouch 那类工具就是这条思路)。
+
+	    这个探针要回答两个问题:
+	      1. 隐根的 ElleKit 到底会不会把 dylib 注入到 backboardd 这个系统守护进程?
+	      2. 如果能注入, 在 backboardd 里派发 HID 触摸能不能真的打到屏幕上?
+
+	    两个都"是", 就可以把正式插件的派发部分搬过来了。
+
+	    backboardd 的 bundle id: com.apple.backboardd
+	-->
+	<key>Filter</key>
+	<dict>
+		<key>Bundles</key>
+		<array>
+			<string>com.apple.backboardd</string>
+		</array>
+	</dict>
+</dict>
+</plist>
