@@ -638,7 +638,8 @@ static void ACDumpSceneForensics(void)
 
     // 试一串可能的 KVC key, 拿主屏 scene manager
     id mgr = nil;
-    for (NSString *key in @[@"mainDisplaySceneManager", @"mainSceneManager",
+    for (NSString *key in @[@"_sceneManager", @"sceneManager",
+                            @"mainDisplaySceneManager", @"mainSceneManager",
                             @"_mainDisplaySceneManager", @"_mainSceneManager"]) {
         id v = ACKVC(coord, key);
         AC_LOG(@"coordinator '%@' -> %@", key, v ? NSStringFromClass([v class]) : @"nil");
@@ -799,7 +800,8 @@ static NSSet *ACForegroundBundleIDsViaScenes(BOOL verbose)
     if (!coord) { if (verbose) AC_LOG(@"检测: 没有 SBSceneManagerCoordinator"); return nil; }
 
     id mgr = nil;
-    for (NSString *key in @[@"mainDisplaySceneManager", @"mainSceneManager"]) {
+    for (NSString *key in @[@"_sceneManager", @"sceneManager",
+                            @"mainDisplaySceneManager", @"mainSceneManager"]) {
         mgr = ACKVC(coord, key);
         if (mgr) break;
     }

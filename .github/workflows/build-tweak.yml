@@ -52,8 +52,6 @@ jobs:
         run: |
           cp src/JDClickerSB.m     tweak/JDClickerSB.m
           cp src/JDClickerSB.plist tweak/JDClickerSB.plist
-          cp src/BBProbe.m         tweak/BBProbe.m
-          cp src/BBProbe.plist     tweak/BBProbe.plist
           VER="1.0.$((2000 + ${{ github.run_number }}))"
           sed -i '' "s/^Version:.*/Version: $VER/" tweak/control
           echo "本次构建版本号: $VER  (来自 run_number ${{ github.run_number }})"

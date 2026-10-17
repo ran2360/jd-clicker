@@ -22,25 +22,16 @@ TARGET := iphone:clang:latest:15.0
 # ★ 关键: 必须同时出 arm64 和 arm64e。SpringBoard 是 arm64e, 只出 arm64 加载不了。
 ARCHS = arm64 arm64e
 
-# 装完让 SpringBoard 重新加载插件 (BBProbe 注入的是 backboardd, 靠注销一并加载)
+# 装完让 SpringBoard 重新加载插件
 INSTALL_TARGET_PROCESSES = SpringBoard
 
 include $(THEOS)/makefiles/common.mk
 
-# ---- 1) SpringBoard 侧: 悬浮球 UI + 引擎 (已验证完全正常) ----
-TWEAK_NAME = JDClickerSB BBProbe
+# ---- SpringBoard 侧: 悬浮球 UI + 引擎 + HID 派发 (已验证完全正常) ----
+TWEAK_NAME = JDClickerSB
 
 JDClickerSB_FILES = JDClickerSB.m
 JDClickerSB_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-parameter
 JDClickerSB_FRAMEWORKS = UIKit Foundation QuartzCore CoreGraphics CoreFoundation
-
-# ---- 2) backboardd 侧: HID 派发探针 ----
-# 为什么要单独一个: SpringBoard 虽然有 hid.client.event-dispatch 权限, 但它
-# 有沙箱 (platform-application / no-sandbox 都是「无」), 实测派发的触摸完全不出现。
-# backboardd 本身就是 HID 事件系统, 不受应用沙箱约束, 是已知可行的替代路径。
-# 这个探针先只回答"能不能注入 backboardd"和"在那里派发通不通"两个问题。
-BBProbe_FILES = BBProbe.m
-BBProbe_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-parameter
-BBProbe_FRAMEWORKS = UIKit Foundation CoreGraphics CoreFoundation
 
 include $(THEOS_MAKE_PATH)/tweak.mk
