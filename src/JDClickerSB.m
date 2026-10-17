@@ -856,7 +856,11 @@ static NSSet *ACForegroundBundleIDsViaScenes(BOOL verbose)
     id handles = ACKVC(mgr, @"externalForegroundApplicationSceneHandles");
     if (verbose) AC_LOG(@"检测: externalForegroundApplicationSceneHandles = %@",
                         handles ? NSStringFromClass([handles class]) : @"nil");
-    if (!handles) return nil;
+    // 1.0.2029 修: 拿到 SBSceneManager 但 handles == nil —— 这表示**当前没有外部应用在前台**
+    // (回到了 SpringBoard 桌面 / 锁屏)。桌面不是京东, 所以返回**空集**而不是 nil:
+    // 返回 nil 会退回 processState 兜底, 而该设备 processState 是十亿级指针永远判"未知",
+    // 未知又按"显示"处理 → 球在桌面不消失。空集让上层判定"不在前台"→ 隐藏。
+    if (!handles) return [NSSet set];
 
     NSArray *array = handles;
     if ([handles respondsToSelector:@selector(allObjects)]) {
