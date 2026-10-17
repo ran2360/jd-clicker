@@ -1,0 +1,8 @@
+Origin: ran2360
+Label: JDClicker
+Suite: stable
+Version: 1.0
+Codename: ios
+Architectures: iphoneos-arm64 iphoneos-arm64e
+Components: main
+Description: JDClicker 京东连点器源 —— 悬浮球/准星瞄准/10-30-50 次每秒, 只在京东前台显示

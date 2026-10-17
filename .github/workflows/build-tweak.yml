@@ -21,6 +21,9 @@ on:
       - '.github/workflows/build-tweak.yml'
   workflow_dispatch:
 
+permissions:
+  contents: write   # 构建完要把生成的 repo/ 提交回 main (越狱源)
+
 jobs:
   build:
     runs-on: macos-14
@@ -221,6 +224,32 @@ jobs:
           print("结论: " + ("切片与 control 都正确 ✓" if ok else "存在问题 ✗"))
           sys.exit(0 if ok else 1)
           PY
+
+      # 把构建出来的 deb 生成 Sileo/Cydia 扁平源 (repo/ 目录), 并提交回 main。
+      # 这样用户只要在 Sileo 里加一次
+      #   https://raw.githubusercontent.com/ran2360/jd-clicker/main/repo/
+      # 以后每次构建完, 源里的包自动更新, 用户点"更新"即可, 不用再下载传手机。
+      #
+      # repo/** 不在上面的 paths 过滤里, 所以提交 repo/ 不会再次触发本工作流 (无死循环)。
+      - name: 生成越狱源并提交回 main
+        if: always()
+        run: |
+          cd tweak
+          if ls packages/*.deb >/dev/null 2>&1; then
+            cd ..
+            python3 tools/make_repo.py --debs "tweak/packages/*.deb" --out repo
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add repo/ tools/make_repo.py
+            if git diff --cached --quiet; then
+              echo "repo/ 没有变化, 跳过提交"
+            else
+              git commit -m "repo: 更新越狱源 (含新 deb)"
+              git push origin HEAD:main
+            fi
+          else
+            echo "!! packages/ 里没有 deb, 跳过源生成"
+          fi
 
       - uses: actions/upload-artifact@v4
         if: always()
