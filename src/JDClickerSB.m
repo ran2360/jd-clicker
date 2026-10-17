@@ -604,6 +604,86 @@ static void ACDumpRunningApps(void)
 
 static id ACTargetSBApplication(void);   // 前置声明: 定义在后面, 诊断里要用
 
+// 列出某个类所有的 ivar 名 —— 找 scene manager 的访问键最直接的办法
+// (ivar 名往往直接是 _mainDisplaySceneManager 这种)。
+static void ACDumpIvars(Class c)
+{
+    if (!c) return;
+    unsigned int n = 0;
+    Ivar *ivars = class_copyIvarList(c, &n);
+    NSMutableArray *names = [NSMutableArray array];
+    for (unsigned int i = 0; i < n; i++) {
+        const char *nm = ivar_getName(ivars[i]);
+        if (nm) [names addObject:[NSString stringWithUTF8String:nm]];
+    }
+    if (ivars) free(ivars);
+    [names sortUsingSelector:@selector(compare:)];
+    AC_LOG(@"  [%@ 的 ivars] %@", NSStringFromClass(c), [names componentsJoinedByString:@", "]);
+}
+
+// 前台检测的重点取证: 搞清楚怎么从 SBSceneManagerCoordinator 一路拿到
+// externalForegroundApplicationSceneHandles, 以及每个句柄怎么提取 bundle id。
+static void ACDumpSceneForensics(void)
+{
+    AC_LOG(@"========== 场景句柄取证 (开始) ==========");
+    id coord = ACSharedInstanceOf(@"SBSceneManagerCoordinator");
+    AC_LOG(@"coordinator sharedInstance = %@", coord ? NSStringFromClass([coord class]) : @"nil");
+    if (coord) {
+        ACDumpIvars(object_getClass(coord));
+        ACDumpSelectorsMatching(object_getClass(coord), "manager");
+        ACDumpSelectorsMatching(object_getClass(coord), "main");
+        ACDumpSelectorsMatching(object_getClass(coord), "display");
+        ACDumpSelectorsMatching(object_getClass(coord), "scene");
+    }
+
+    // 试一串可能的 KVC key, 拿主屏 scene manager
+    id mgr = nil;
+    for (NSString *key in @[@"mainDisplaySceneManager", @"mainSceneManager",
+                            @"_mainDisplaySceneManager", @"_mainSceneManager"]) {
+        id v = ACKVC(coord, key);
+        AC_LOG(@"coordinator '%@' -> %@", key, v ? NSStringFromClass([v class]) : @"nil");
+        if (v && !mgr) mgr = v;
+    }
+
+    if (mgr) {
+        ACDumpIvars(object_getClass(mgr));
+        ACDumpSelectorsMatching(object_getClass(mgr), "foreground");
+        ACDumpSelectorsMatching(object_getClass(mgr), "handle");
+        ACDumpSelectorsMatching(object_getClass(mgr), "scene");
+
+        id handles = ACKVC(mgr, @"externalForegroundApplicationSceneHandles");
+        AC_LOG(@"externalForegroundApplicationSceneHandles = %@",
+               handles ? NSStringFromClass([handles class]) : @"nil");
+        if (handles) {
+            NSArray *arr = handles;
+            if ([handles respondsToSelector:@selector(allObjects)]) {
+                arr = [handles performSelector:@selector(allObjects)];
+            }
+            if ([arr isKindOfClass:[NSArray class]]) {
+                AC_LOG(@"前台句柄数 = %lu", (unsigned long)arr.count);
+                for (id h in arr) {
+                    AC_LOG(@"  句柄: %@", NSStringFromClass([h class]));
+                    ACDumpIvars(object_getClass(h));
+                    ACDumpSelectorsMatching(object_getClass(h), "application");
+                    ACDumpSelectorsMatching(object_getClass(h), "scene");
+                    ACDumpSelectorsMatching(object_getClass(h), "bundle");
+                    // 逐个试提取 bundle id
+                    for (NSString *k in @[@"application", @"_application",
+                                          @"sceneIfExists", @"scene",
+                                          @"clientIdentity", @"processIdentity"]) {
+                        id o = ACKVC(h, k);
+                        if (!o) continue;
+                        id bid = ACKVC(o, @"bundleIdentifier");
+                        AC_LOG(@"    '%@' -> %@  bundleId=%@", k, NSStringFromClass([o class]),
+                               bid ?: @"(nil)");
+                    }
+                }
+            }
+        }
+    }
+    AC_LOG(@"========== 场景句柄取证 (结束) ==========");
+}
+
 static void ACDumpForegroundDiagnostics(void)
 {
 
@@ -695,6 +775,8 @@ static void ACDumpForegroundDiagnostics(void)
                    v ? NSStringFromClass([v class]) : @"nil");
         }
     }
+
+    ACDumpSceneForensics();      // ★ 取证: 找出 scene manager 的正确访问路径
 
     AC_LOG(@"========== 前台检测诊断 (结束) ==========");
 }
