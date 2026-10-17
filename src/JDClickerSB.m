@@ -643,8 +643,12 @@ static void ACDumpRunningApps(void)
         for (NSString *l in lines) AC_LOG(@"    %@", l);
     }
 }
+
+static id ACTargetSBApplication(void);   // 前置声明: 定义在后面, 诊断里要用
+
 static void ACDumpForegroundDiagnostics(void)
 {
+
     ACProbeOwnEntitlements();          // ★ 先查权限, 这是"派发不生效"的头号嫌疑
     AC_LOG(@"========== 前台检测诊断 (开始) ==========");
 
@@ -697,13 +701,41 @@ static void ACDumpForegroundDiagnostics(void)
     }
 
     for (NSString *cn in @[@"SBSceneManagerCoordinator", @"SBMainWorkspace",
-                           @"FBSceneManager", @"SBUIController"]) {
+                           @"FBSceneManager", @"SBUIController", @"SBSceneManager",
+                           @"SBApplicationSceneHandle"]) {
         Class c = NSClassFromString(cn);
         AC_LOG(@"%@: %@", cn, c ? @"存在" : @"不存在");
         if (!c) continue;
         id inst = ACSharedInstanceOf(cn);
-        if (!inst) continue;
-        ACDumpSelectorsMatching(object_getClass(inst), "front");
+        ACDumpSelectorsMatching(c, "front");
+        ACDumpSelectorsMatching(c, "fore");
+        ACDumpSelectorsMatching(c, "active");
+        ACDumpSelectorsMatching(c, "current");
+        if (inst) {
+            ACDumpSelectorsMatching(object_getClass(inst), "front");
+            ACDumpSelectorsMatching(object_getClass(inst), "fore");
+        }
+    }
+
+    // SBApplication 上我还没搜过的关键词 (之前只搜了 front/state/active)
+    id probeApp = ACTargetSBApplication();
+    if (probeApp) {
+        Class ac = object_getClass(probeApp);
+        ACDumpSelectorsMatching(ac, "fore");
+        ACDumpSelectorsMatching(ac, "ground");
+        ACDumpSelectorsMatching(ac, "running");
+        ACDumpSelectorsMatching(ac, "visible");
+    }
+
+    // 直接试几个 KVC key, 看哪个能拿到"前台应用"
+    id ws = ACSharedInstanceOf(@"SBMainWorkspace");
+    if (ws) {
+        for (NSString *key in @[@"frontmostApplication", @"currentApplication",
+                                @"_frontmostApplication", @"_currentApplication"]) {
+            id v = ACKVC(ws, key);
+            AC_LOG(@"SBMainWorkspace '%@' -> %@", key,
+                   v ? NSStringFromClass([v class]) : @"nil");
+        }
     }
 
     AC_LOG(@"========== 前台检测诊断 (结束) ==========");
@@ -1287,7 +1319,10 @@ static UIWindowScene *ACAnyWindowScene(void)
     id alwaysPref = [d objectForKey:kACKeyAlways];
     _alwaysShow = (alwaysPref == nil) ? YES : [d boolForKey:kACKeyAlways];
 
-    _methodIndex = [d integerForKey:kACKeyMethod];      // 默认 0 = 方式1
+    // ★ 派发方式: 固定用方式1 (IOHIDEventSystemClientCreate + 固定 senderID)。
+    //   实测这是唯一能真正点中屏幕的方式 (方式2~5 都不行), 所以不再读持久化的
+    //   jd_method —— 设备上之前残留的"方式5"会导致点击无效, 这里强制回到方式1。
+    _methodIndex = 0;
     if (_methodIndex < 0 || _methodIndex >= kACMethodCount) _methodIndex = 0;
 }
 
