@@ -481,305 +481,12 @@ static id ACKVC(id obj, NSString *key)
     @try { return [obj valueForKey:key]; } @catch (NSException *e) { return nil; }
 }
 
-#pragma mark - 权限自检
-
-// ★ 这一步是关键怀疑的定性手段 ★
-//
-// 系统级 HID 触摸派发需要进程有 com.apple.private.hid.client.event-dispatch
-// 这个 entitlement。backboardd 肯定有 (它本身就是 HID 事件系统), 但
-// **SpringBoard 有没有, 我并不确定** —— 而实测"桌面图标也点不动"说明派发完全没生效,
-// 权限不足是最可能的原因之一。
-//
-// SecTaskCreateFromSelf 能直接读出本进程代码签名里的 entitlements, 所以不用猜。
-static void ACProbeOwnEntitlements(void)
-{
-    typedef struct __SecTask *ACSecTaskRef;
-    typedef ACSecTaskRef (*ACSecTaskCreateFromSelfFn)(CFAllocatorRef);
-    typedef CFTypeRef (*ACSecTaskCopyValueFn)(ACSecTaskRef, CFStringRef, CFErrorRef *);
-
-    // 用 dlsym 取, 免得为了这两个私有 API 去链接 Security.framework
-    ACSecTaskCreateFromSelfFn create =
-        (ACSecTaskCreateFromSelfFn)dlsym(RTLD_DEFAULT, "SecTaskCreateFromSelf");
-    ACSecTaskCopyValueFn copy =
-        (ACSecTaskCopyValueFn)dlsym(RTLD_DEFAULT, "SecTaskCopyValueForEntitlement");
-    if (!create || !copy) {
-        AC_LOG(@"权限自检: 拿不到 SecTask API, 跳过");
-        return;
-    }
-    ACSecTaskRef task = create(kCFAllocatorDefault);
-    if (!task) { AC_LOG(@"权限自检: SecTaskCreateFromSelf 返回空"); return; }
-
-    static const char *keys[] = {
-        "com.apple.private.hid.client.event-dispatch",
-        "com.apple.private.hid.client.event-filter",
-        "com.apple.private.hid.client.event-monitor",
-        "platform-application",
-        "com.apple.private.security.no-sandbox",
-        "com.apple.private.security.storage.AppDataContainers",
-        NULL
-    };
-
-    AC_LOG(@"---------- 本进程权限自检 (当前进程 = SpringBoard) ----------");
-    for (int i = 0; keys[i] != NULL; i++) {
-        CFStringRef k = CFStringCreateWithCString(kCFAllocatorDefault, keys[i],
-                                                  kCFStringEncodingUTF8);
-        CFTypeRef v = copy(task, k, NULL);
-        AC_LOG(@"  %-52s : %@", keys[i], v ? @"有" : @"无");
-        if (v) CFRelease(v);
-        CFRelease(k);
-    }
-    AC_LOG(@"  ↑ 如果 hid.client.event-dispatch 是「无」, 那就是派发不生效的根因:");
-    AC_LOG(@"    SpringBoard 沙箱不允许, 需要把派发放到 backboardd 侧去做。");
-    AC_LOG(@"--------------------------------------------------------------");
-    CFRelease(task);
-}
-
-#pragma mark - 诊断: 把能找到的东西全打出来
-
-// 列出某个类上所有名字包含 needle 的方法 —— 这是找对 selector 名最直接的办法。
-static void ACDumpSelectorsMatching(Class c, const char *needle)
-{
-    if (!c) return;
-    unsigned int n = 0;
-    Method *ms = class_copyMethodList(c, &n);
-    NSMutableArray *hits = [NSMutableArray array];
-    for (unsigned int i = 0; i < n; i++) {
-        const char *sn = sel_getName(method_getName(ms[i]));
-        if (sn && strcasestr(sn, needle)) {
-            [hits addObject:[NSString stringWithUTF8String:sn]];
-        }
-    }
-    if (ms) free(ms);
-    [hits sortUsingSelector:@selector(compare:)];
-    AC_LOG(@"    [%@ 中名含 \"%s\"] %@", NSStringFromClass(c), needle,
-           hits.count ? [hits componentsJoinedByString:@", "] : @"(无)");
-}
-
-static NSArray *ACAllSBApplications(id ctrl)
-{
-    id all = ACKVC(ctrl, @"allApplications");
-    if (![all isKindOfClass:[NSArray class]]) all = ACKVC(ctrl, @"_applications");
-    if (![all isKindOfClass:[NSArray class]]) all = nil;
-    return all;
-}
-
-// 读一个 SBApplication 的两个进程状态字段。
-//
-// 为什么两个都读: 实测 processState 返回的是 10773618432 这种大数 (见日志里的
-// com.apple.PosterBoard), 根本不是小枚举 —— 所以 "processState == 4" 这条判定
-// 从一开始就不可能对。而 SBApplication 上还有一个 _internalProcessState,
-// 那个更可能是干净的小枚举。两个都记, 才不用再猜一轮。
+// 读一个 SBApplication 的两个进程状态字段 (processState / _internalProcessState)。
 static void ACReadAppStates(id app, NSInteger *pub, BOOL *pubOK,
                             NSInteger *inn, BOOL *innOK)
 {
     if (pub)   *pub = ACCallInt(app, @"processState", pubOK);
     if (inn)   *inn = ACCallInt(app, @"_internalProcessState", innOK);
-}
-
-static void ACDumpRunningApps(void)
-{
-    id ctrl = ACSharedInstanceOf(@"SBApplicationController");
-    if (!ctrl) return;
-    NSArray *all = ACAllSBApplications(ctrl);
-    if (!all) return;
-
-    NSMutableArray *lines = [NSMutableArray array];
-    for (id a in all) {
-        BOOL ok1 = NO, ok2 = NO;
-        NSInteger pub = 0, inn = 0;
-        ACReadAppStates(a, &pub, &ok1, &inn, &ok2);
-        if (!ok1 && !ok2) continue;
-        if ((!ok1 || pub == 0) && (!ok2 || inn == 0)) continue;   // 两个都是 0 视为没运行
-        id bid = ACCallObj(a, @"bundleIdentifier");
-        [lines addObject:[NSString stringWithFormat:@"%@(pub=%ld,inn=%ld)",
-                          bid ?: @"?", (long)pub, (long)inn]];
-    }
-    if (lines.count == 0) {
-        AC_LOG(@"当前没有运行中的应用");
-    } else {
-        AC_LOG(@"正在运行的应用 (bundleId(pub=processState,inn=_internalProcessState)):");
-        for (NSString *l in lines) AC_LOG(@"    %@", l);
-    }
-}
-
-static id ACTargetSBApplication(void);   // 前置声明: 定义在后面, 诊断里要用
-
-// 列出某个类所有的 ivar 名 —— 找 scene manager 的访问键最直接的办法
-// (ivar 名往往直接是 _mainDisplaySceneManager 这种)。
-static void ACDumpIvars(Class c)
-{
-    if (!c) return;
-    unsigned int n = 0;
-    Ivar *ivars = class_copyIvarList(c, &n);
-    NSMutableArray *names = [NSMutableArray array];
-    for (unsigned int i = 0; i < n; i++) {
-        const char *nm = ivar_getName(ivars[i]);
-        if (nm) [names addObject:[NSString stringWithUTF8String:nm]];
-    }
-    if (ivars) free(ivars);
-    [names sortUsingSelector:@selector(compare:)];
-    AC_LOG(@"  [%@ 的 ivars] %@", NSStringFromClass(c), [names componentsJoinedByString:@", "]);
-}
-
-// 前台检测的重点取证: 搞清楚怎么从 SBSceneManagerCoordinator 一路拿到
-// externalForegroundApplicationSceneHandles, 以及每个句柄怎么提取 bundle id。
-static void ACDumpSceneForensics(void)
-{
-    AC_LOG(@"========== 场景句柄取证 (开始) ==========");
-    id coord = ACSharedInstanceOf(@"SBSceneManagerCoordinator");
-    AC_LOG(@"coordinator sharedInstance = %@", coord ? NSStringFromClass([coord class]) : @"nil");
-    if (coord) {
-        ACDumpIvars(object_getClass(coord));
-        ACDumpSelectorsMatching(object_getClass(coord), "manager");
-        ACDumpSelectorsMatching(object_getClass(coord), "main");
-        ACDumpSelectorsMatching(object_getClass(coord), "display");
-        ACDumpSelectorsMatching(object_getClass(coord), "scene");
-    }
-
-    // 试一串可能的 KVC key, 拿主屏 scene manager
-    id mgr = nil;
-    for (NSString *key in @[@"_sceneManager", @"sceneManager",
-                            @"mainDisplaySceneManager", @"mainSceneManager",
-                            @"_mainDisplaySceneManager", @"_mainSceneManager"]) {
-        id v = ACKVC(coord, key);
-        AC_LOG(@"coordinator '%@' -> %@", key, v ? NSStringFromClass([v class]) : @"nil");
-        if (v && !mgr) mgr = v;
-    }
-
-    if (mgr) {
-        ACDumpIvars(object_getClass(mgr));
-        ACDumpSelectorsMatching(object_getClass(mgr), "foreground");
-        ACDumpSelectorsMatching(object_getClass(mgr), "handle");
-        ACDumpSelectorsMatching(object_getClass(mgr), "scene");
-
-        id handles = ACKVC(mgr, @"externalForegroundApplicationSceneHandles");
-        AC_LOG(@"externalForegroundApplicationSceneHandles = %@",
-               handles ? NSStringFromClass([handles class]) : @"nil");
-        if (handles) {
-            NSArray *arr = handles;
-            if ([handles respondsToSelector:@selector(allObjects)]) {
-                arr = [handles performSelector:@selector(allObjects)];
-            }
-            if ([arr isKindOfClass:[NSArray class]]) {
-                AC_LOG(@"前台句柄数 = %lu", (unsigned long)arr.count);
-                for (id h in arr) {
-                    AC_LOG(@"  句柄: %@", NSStringFromClass([h class]));
-                    ACDumpIvars(object_getClass(h));
-                    ACDumpSelectorsMatching(object_getClass(h), "application");
-                    ACDumpSelectorsMatching(object_getClass(h), "scene");
-                    ACDumpSelectorsMatching(object_getClass(h), "bundle");
-                    // 逐个试提取 bundle id
-                    for (NSString *k in @[@"application", @"_application",
-                                          @"sceneIfExists", @"scene",
-                                          @"clientIdentity", @"processIdentity"]) {
-                        id o = ACKVC(h, k);
-                        if (!o) continue;
-                        id bid = ACKVC(o, @"bundleIdentifier");
-                        AC_LOG(@"    '%@' -> %@  bundleId=%@", k, NSStringFromClass([o class]),
-                               bid ?: @"(nil)");
-                    }
-                }
-            }
-        }
-    }
-    AC_LOG(@"========== 场景句柄取证 (结束) ==========");
-}
-
-static void ACDumpForegroundDiagnostics(void)
-{
-
-    ACProbeOwnEntitlements();          // ★ 先查权限, 这是"派发不生效"的头号嫌疑
-    AC_LOG(@"========== 前台检测诊断 (开始) ==========");
-
-    Class ctrlC = NSClassFromString(@"SBApplicationController");
-    AC_LOG(@"SBApplicationController: %@", ctrlC ? @"存在" : @"不存在");
-    if (ctrlC) ACDumpSelectorsMatching(ctrlC, "application");
-
-    id ctrl = ACSharedInstanceOf(@"SBApplicationController");
-    AC_LOG(@"  sharedInstance: %@", ctrl ? @"拿到" : @"拿不到");
-
-    if (ctrl) {
-        SEL appSel = NSSelectorFromString(@"applicationWithBundleIdentifier:");
-        AC_LOG(@"  响应 applicationWithBundleIdentifier: %@",
-               [ctrl respondsToSelector:appSel] ? @"是" : @"否");
-
-        id app = ACCallObj1(ctrl, @"applicationWithBundleIdentifier:", kJDTargetBundle);
-        AC_LOG(@"  查询 %@ -> %@", kJDTargetBundle,
-               app ? NSStringFromClass([app class]) : @"nil");
-
-        if (app) {
-            Class ac = object_getClass(app);
-            ACDumpSelectorsMatching(ac, "front");
-            ACDumpSelectorsMatching(ac, "state");
-            ACDumpSelectorsMatching(ac, "active");
-
-            BOOL ok = NO;
-            NSInteger st = ACCallInt(app, @"processState", &ok);
-            AC_LOG(@"    processState = %ld (%@)", (long)st, ok ? @"可读" : @"不存在");
-            BOOL f = ACCallBool(app, @"isFrontmost", &ok);
-            AC_LOG(@"    isFrontmost = %@ (%@)", f ? @"YES" : @"NO", ok ? @"可读" : @"不存在");
-            id bid = ACCallObj(app, @"bundleIdentifier");
-            AC_LOG(@"    bundleIdentifier = %@", bid ?: @"(nil)");
-        }
-
-        // ★ 最关键的一条: 把 SpringBoard 当前认识的所有 bundle id 列出来。
-        //   如果京东的 id 不在里面, 说明我们的 bundle id 写错了。
-        NSArray *all = ACAllSBApplications(ctrl);
-        if (all) {
-            NSMutableArray *ids = [NSMutableArray array];
-            for (id a in all) {
-                id bid = ACCallObj(a, @"bundleIdentifier");
-                if (bid) [ids addObject:bid];
-            }
-            [ids sortUsingSelector:@selector(compare:)];
-            AC_LOG(@"  SpringBoard 已知应用 %lu 个:", (unsigned long)ids.count);
-            AC_LOG(@"    %@", [ids componentsJoinedByString:@", "]);
-        } else {
-            AC_LOG(@"  拿不到 allApplications / _applications");
-        }
-    }
-
-    for (NSString *cn in @[@"SBSceneManagerCoordinator", @"SBMainWorkspace",
-                           @"FBSceneManager", @"SBUIController", @"SBSceneManager",
-                           @"SBApplicationSceneHandle"]) {
-        Class c = NSClassFromString(cn);
-        AC_LOG(@"%@: %@", cn, c ? @"存在" : @"不存在");
-        if (!c) continue;
-        id inst = ACSharedInstanceOf(cn);
-        ACDumpSelectorsMatching(c, "front");
-        ACDumpSelectorsMatching(c, "fore");
-        ACDumpSelectorsMatching(c, "active");
-        ACDumpSelectorsMatching(c, "current");
-        if (inst) {
-            ACDumpSelectorsMatching(object_getClass(inst), "front");
-            ACDumpSelectorsMatching(object_getClass(inst), "fore");
-        }
-    }
-
-    // SBApplication 上我还没搜过的关键词 (之前只搜了 front/state/active)
-    id probeApp = ACTargetSBApplication();
-    if (probeApp) {
-        Class ac = object_getClass(probeApp);
-        ACDumpSelectorsMatching(ac, "fore");
-        ACDumpSelectorsMatching(ac, "ground");
-        ACDumpSelectorsMatching(ac, "running");
-        ACDumpSelectorsMatching(ac, "visible");
-    }
-
-    // 直接试几个 KVC key, 看哪个能拿到"前台应用"
-    id ws = ACSharedInstanceOf(@"SBMainWorkspace");
-    if (ws) {
-        for (NSString *key in @[@"frontmostApplication", @"currentApplication",
-                                @"_frontmostApplication", @"_currentApplication"]) {
-            id v = ACKVC(ws, key);
-            AC_LOG(@"SBMainWorkspace '%@' -> %@", key,
-                   v ? NSStringFromClass([v class]) : @"nil");
-        }
-    }
-
-    ACDumpSceneForensics();      // ★ 取证: 找出 scene manager 的正确访问路径
-
-    AC_LOG(@"========== 前台检测诊断 (结束) ==========");
 }
 
 #pragma mark - 前台检测
@@ -803,6 +510,10 @@ static id ACGetSBSceneManager(id coord)
 {
     if (!coord) return nil;
 
+    // 单例缓存: SBSceneManager 在 SpringBoard 整个生命周期内不变, 不用每次反射查找。
+    static id sCachedManager = nil;
+    if (sCachedManager) return sCachedManager;
+
     SEL fgSel = NSSelectorFromString(@"externalForegroundApplicationSceneHandles");
 
     // 方法1: _displayIdentityToReferenceMap 的 key 就是 display identity,
@@ -812,7 +523,7 @@ static id ACGetSBSceneManager(id coord)
         NSArray *keys = [refMap performSelector:@selector(allKeys)];
         for (id key in keys) {
             id m = ACCallObj1(coord, @"sceneManagerForDisplayIdentity:", key);
-            if (m && [m respondsToSelector:fgSel]) return m;
+            if (m && [m respondsToSelector:fgSel]) { sCachedManager = m; return m; }
         }
     }
 
@@ -828,7 +539,7 @@ static id ACGetSBSceneManager(id coord)
         } @catch (NSException *e) {
             AC_LOG(@"检测: enumerateSceneManagersWithBlock 异常: %@", e.reason);
         }
-        if (found) return found;
+        if (found) { sCachedManager = found; return found; }
     }
 
     // 方法3: 老 KVC 键兜底, 只收下"真的响应 externalForegroundApplicationSceneHandles"的那个。
@@ -836,14 +547,19 @@ static id ACGetSBSceneManager(id coord)
                             @"mainDisplaySceneManager", @"mainSceneManager",
                             @"_mainDisplaySceneManager", @"_mainSceneManager"]) {
         id m = ACKVC(coord, key);
-        if (m && [m respondsToSelector:fgSel]) return m;
+        if (m && [m respondsToSelector:fgSel]) { sCachedManager = m; return m; }
     }
     return nil;
 }
 
 static NSSet *ACForegroundBundleIDsViaScenes(BOOL verbose)
 {
-    id coord = ACSharedInstanceOf(@"SBSceneManagerCoordinator");
+    // coordinator 也是单例, 缓存起来省一次反射查找。
+    static id sCachedCoordinator = nil;
+    if (!sCachedCoordinator) {
+        sCachedCoordinator = ACSharedInstanceOf(@"SBSceneManagerCoordinator");
+    }
+    id coord = sCachedCoordinator;
     if (!coord) { if (verbose) AC_LOG(@"检测: 没有 SBSceneManagerCoordinator"); return nil; }
 
     id mgr = ACGetSBSceneManager(coord);
@@ -1133,10 +849,7 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
     BOOL                 _hasPoint;
     NSInteger            _freqIndex;
     BOOL                 _targetFront;
-    NSTimer             *_visTimer;
     NSInteger            _installRetry;
-    NSInteger            _tickCount;
-    NSInteger            _lastTargetState; // 京东 processState 的上一个值 (用来发现变化)
 }
 
 + (instancetype)shared
@@ -1155,7 +868,6 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
 
     AC_LOG(@"bootstrap: 日志文件 = %@", ACLogFilePath() ?: @"(写不进去)");
 
-    _lastTargetState = NSIntegerMin;    // 保证第一次读到就记一条变化
     [self loadPrefs];
     [[ACTouchInjector shared] prepare];
 
@@ -1227,14 +939,11 @@ static UIWindowScene *ACAnyWindowScene(void)
     [self buildCrosshair];
     [self refreshUI];
 
-    _window.hidden = YES;                 // 先藏起来, 由可见性定时器决定
+    _window.hidden = YES;                 // 先藏起来, 由可见性调度器决定
 
-    // 可见性: 每 0.3 秒看一次京东在不在前台
-    _visTimer = [NSTimer scheduledTimerWithTimeInterval:0.3
-                                                target:self
-                                              selector:@selector(onVisTick)
-                                              userInfo:nil
-                                               repeats:YES];
+    // 可见性: 自适应轮询。球隐藏(京东不在前台)时用 1.5s 低频省电,
+    // 球显示时用 0.5s 及时响应切走。用 dispatch_after 链代替固定 NSTimer。
+    [self scheduleNextVisTick];
     AC_LOG(@"悬浮窗已安装(SpringBoard): 窗口=%.0fx%.0f 球心=(%.0f, %.0f) level=%.0f",
            _window.bounds.size.width, _window.bounds.size.height,
            _ball.center.x, _ball.center.y, _window.windowLevel);
@@ -1242,37 +951,27 @@ static UIWindowScene *ACAnyWindowScene(void)
     return YES;
 }
 
+// 自适应轮询调度: 球隐藏(京东不在前台)时用低频 1.5s 省电, 显示时用 0.5s 及时响应。
+// 用 dispatch_after 链式调度, 每次 tick 后根据当前显隐状态决定下一次的间隔。
+- (void)scheduleNextVisTick
+{
+    if (!_window) return;
+    NSTimeInterval interval = _window.hidden ? 1.5 : 0.5;
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(interval * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [weakSelf onVisTick];
+    });
+}
+
 - (void)onVisTick
 {
-    _tickCount++;
-
-    // 装好 5 秒后打一次完整诊断 (不管当前是什么显示模式, 都要拿到这些数据)
-    if (_tickCount == 17) {     // 0.3s * 17 ≈ 5s
-        @try { ACDumpForegroundDiagnostics(); }
-        @catch (NSException *e) { AC_LOG(@"诊断异常: %@ - %@", e.name, e.reason); }
-    }
-
     ACFrontProbe probe = ACProbeTargetFrontmost(NO);
     BOOL front = (probe == ACFrontProbeYes);
 
     // 「仅京东显示」: 只有**确认**京东在前台时才显示;
     // 检测手段不可用(未知)时**也显示**, 免得球藏起来后用户点不到它 (1.0.10 的教训)。
     BOOL shouldShow = (probe != ACFrontProbeNo);
-
-    // 记录京东 processState 的变化 (旧检测方式的数据; 场景句柄不可用时还能用来兜底)
-    {
-        id app = ACTargetSBApplication();
-        if (app) {
-            BOOL ok = NO;
-            NSInteger st = ACCallInt(app, @"processState", &ok);
-            if (ok && st != _lastTargetState) {
-                AC_LOG(@"★ %@ 的 processState 变化: %ld -> %ld",
-                       kJDTargetName, (long)_lastTargetState, (long)st);
-                _lastTargetState = st;
-                ACDumpRunningApps();
-            }
-        }
-    }
 
     if (front != _targetFront) {
         _targetFront = front;
@@ -1289,6 +988,8 @@ static UIWindowScene *ACAnyWindowScene(void)
         if (!wantHidden) AC_LOG(@"悬浮球已显示");
         else AC_LOG(@"悬浮球已隐藏");
     }
+
+    [self scheduleNextVisTick];
 }
 
 #pragma mark 构建 UI
