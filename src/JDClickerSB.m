@@ -557,9 +557,19 @@ static NSArray *ACAllSBApplications(id ctrl)
     return all;
 }
 
-// 列出当前所有"正在运行"的应用及其 processState。
-// 目的: 我们还不确定 processState 的哪个数值对应"前台" —— 让用户开一次京东,
-// 日志里就能直接看到那个值。(日志第 37 行拿到 0, 是因为诊断跑在京东还没启动时。)
+// 读一个 SBApplication 的两个进程状态字段。
+//
+// 为什么两个都读: 实测 processState 返回的是 10773618432 这种大数 (见日志里的
+// com.apple.PosterBoard), 根本不是小枚举 —— 所以 "processState == 4" 这条判定
+// 从一开始就不可能对。而 SBApplication 上还有一个 _internalProcessState,
+// 那个更可能是干净的小枚举。两个都记, 才不用再猜一轮。
+static void ACReadAppStates(id app, NSInteger *pub, BOOL *pubOK,
+                            NSInteger *inn, BOOL *innOK)
+{
+    if (pub)   *pub = ACCallInt(app, @"processState", pubOK);
+    if (inn)   *inn = ACCallInt(app, @"_internalProcessState", innOK);
+}
+
 static void ACDumpRunningApps(void)
 {
     id ctrl = ACSharedInstanceOf(@"SBApplicationController");
@@ -569,17 +579,20 @@ static void ACDumpRunningApps(void)
 
     NSMutableArray *lines = [NSMutableArray array];
     for (id a in all) {
-        BOOL ok = NO;
-        NSInteger st = ACCallInt(a, @"processState", &ok);
-        if (!ok || st == 0) continue;                 // 只列非 0 的
+        BOOL ok1 = NO, ok2 = NO;
+        NSInteger pub = 0, inn = 0;
+        ACReadAppStates(a, &pub, &ok1, &inn, &ok2);
+        if (!ok1 && !ok2) continue;
+        if ((!ok1 || pub == 0) && (!ok2 || inn == 0)) continue;   // 两个都是 0 视为没运行
         id bid = ACCallObj(a, @"bundleIdentifier");
-        [lines addObject:[NSString stringWithFormat:@"%@=%ld", bid ?: @"?", (long)st]];
+        [lines addObject:[NSString stringWithFormat:@"%@(pub=%ld,inn=%ld)",
+                          bid ?: @"?", (long)pub, (long)inn]];
     }
     if (lines.count == 0) {
-        AC_LOG(@"当前没有 processState 非 0 的应用");
+        AC_LOG(@"当前没有运行中的应用");
     } else {
-        AC_LOG(@"正在运行的应用 (bundleId=processState): %@",
-               [lines componentsJoinedByString:@", "]);
+        AC_LOG(@"正在运行的应用 (bundleId(pub=processState,inn=_internalProcessState)):");
+        for (NSString *l in lines) AC_LOG(@"    %@", l);
     }
 }
 static void ACDumpForegroundDiagnostics(void)
@@ -678,18 +691,33 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
         if (verbose) AC_LOG(@"检测: isFrontmost = %@", front ? @"YES" : @"NO");
         return front ? ACFrontProbeYes : ACFrontProbeNo;
     }
-    NSInteger st = ACCallInt(app, @"processState", &ok);
-    if (ok) {
-        if (verbose) AC_LOG(@"检测: processState = %ld (前台应为 %ld)",
-                            (long)st, (long)kSBProcessStateForeground);
-        return (st == kSBProcessStateForeground) ? ACFrontProbeYes : ACFrontProbeNo;
+
+    // 两个状态字段都读一遍 (processState 实测是大数, _internalProcessState 才是小枚举)
+    BOOL okPub = NO, okInn = NO;
+    NSInteger pub = 0, inn = 0;
+    ACReadAppStates(app, &pub, &okPub, &inn, &okInn);
+    if (verbose) {
+        AC_LOG(@"检测: processState=%ld (%@)  _internalProcessState=%ld (%@)",
+               (long)pub, okPub ? @"可读" : @"无",
+               (long)inn, okInn ? @"可读" : @"无");
     }
+
+    // 用 _internalProcessState 判定 (如果它真的是小枚举)
+    if (okInn && inn >= 0 && inn <= 8) {
+        return (inn == kSBProcessStateForeground) ? ACFrontProbeYes : ACFrontProbeNo;
+    }
+    // 退一步: processState 也只有在小范围内才拿来做判定
+    if (okPub && pub >= 0 && pub <= 8) {
+        return (pub == kSBProcessStateForeground) ? ACFrontProbeYes : ACFrontProbeNo;
+    }
+    // 拿到的都不是小枚举 -> 说明这套判定方式在这台设备上不适用, 交给兜底
+    if (verbose) AC_LOG(@"检测: 两个状态字段都不是小枚举, 无法判定 -> 未知");
+
     BOOL run = ACCallBool(app, @"isRunning", &ok);
     if (ok) {
         if (verbose) AC_LOG(@"检测: isRunning = %@", run ? @"YES" : @"NO");
         return run ? ACFrontProbeYes : ACFrontProbeNo;
     }
-    if (verbose) AC_LOG(@"检测: app 对象上找不到任何可用判定方法 -> 未知");
     return ACFrontProbeUnknown;
 }
 
@@ -886,6 +914,11 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
 
     _lastTargetState = NSIntegerMin;    // 保证第一次读到就记一条变化
     [self loadPrefs];
+
+    // ★ 必须在第一次 prepare 之前把「派发方式」同步给注入器 ★
+    //   之前漏了这一步: 界面上的 _methodIndex 会变, 但注入器里那份永远是 0,
+    //   于是用户切换 5 次, 建的 5 个 client 其实全是「方式1」。
+    [ACTouchInjector shared].methodIndex = _methodIndex;
     [[ACTouchInjector shared] prepare];
 
     ACClickEngine *eng = [ACClickEngine shared];
@@ -1374,8 +1407,14 @@ static UIWindowScene *ACAnyWindowScene(void)
     BOOL wasRunning = eng.running;
     if (wasRunning) [eng stop];
 
-    [[ACTouchInjector shared] prepare];      // 按新方式重建 client
-    AC_LOG(@"切换派发方式 -> 方式%ld", (long)_methodIndex + 1);
+    // ★ 这里曾经漏了一行, 导致 5 种方式实际跑的全是「方式1」★
+    //   methodIndex 存了两份 (界面一份、注入器一份), 只改了界面那份。
+    ACTouchInjector *inj = [ACTouchInjector shared];
+    inj.methodIndex = _methodIndex;
+    [inj prepare];                            // 按新方式重建 client
+
+    AC_LOG(@"切换派发方式 -> 方式%ld   (注入器实际 methodIndex=%ld, client=%@)",
+           (long)_methodIndex + 1, (long)inj.methodIndex, inj.clientKind);
     AC_LOG(@"  提示: 换方式后请到 SpringBoard 桌面把准星对准一个 App 图标试点击 ——");
     AC_LOG(@"  那里能最直接地看出 HID 派发到底通不通 (图标被点开 = 通了)。");
     if (wasRunning) [eng start];
