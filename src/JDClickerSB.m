@@ -794,18 +794,64 @@ static id ACTargetSBApplication(void)
 // scene handle 集合, 逐个提取 bundle id。
 // 这是 iOS 16 上判断"前台应用"的权威来源 —— 实测 SBApplication.processState 返回的是
 // 十亿级别的指针/结构体 (不是小枚举), 那个路径根本不能用。
+//
+// 关键坑 (1.0.2028 修): coordinator 的 `_sceneManager` KVC 返回的是 **FBSceneManager**
+// (基类), 它**没有** externalForegroundApplicationSceneHandles 方法 —— 那个方法是
+// **SBSceneManager**(子类) 上的。所以必须用 `sceneManagerForDisplayIdentity:` 或枚举
+// 才能拿到真正的 SBSceneManager 实例。
+static id ACGetSBSceneManager(id coord)
+{
+    if (!coord) return nil;
+
+    SEL fgSel = NSSelectorFromString(@"externalForegroundApplicationSceneHandles");
+
+    // 方法1: _displayIdentityToReferenceMap 的 key 就是 display identity,
+    //        用它调 sceneManagerForDisplayIdentity: 拿 SBSceneManager。
+    id refMap = ACKVC(coord, @"_displayIdentityToReferenceMap");
+    if (refMap && [refMap respondsToSelector:@selector(allKeys)]) {
+        NSArray *keys = [refMap performSelector:@selector(allKeys)];
+        for (id key in keys) {
+            id m = ACCallObj1(coord, @"sceneManagerForDisplayIdentity:", key);
+            if (m && [m respondsToSelector:fgSel]) return m;
+        }
+    }
+
+    // 方法2: 枚举 (不依赖 display identity)。用 @try 包住, 防止 block 签名差异导致崩溃。
+    SEL enumSel = NSSelectorFromString(@"enumerateSceneManagersWithBlock:");
+    if ([coord respondsToSelector:enumSel]) {
+        __block id found = nil;
+        void (^blk)(id) = ^(id m) {
+            if (m && [m respondsToSelector:fgSel] && !found) found = m;
+        };
+        @try {
+            ((void (*)(id, SEL, void *))objc_msgSend)(coord, enumSel, (__bridge void *)blk);
+        } @catch (NSException *e) {
+            AC_LOG(@"检测: enumerateSceneManagersWithBlock 异常: %@", e.reason);
+        }
+        if (found) return found;
+    }
+
+    // 方法3: 老 KVC 键兜底, 只收下"真的响应 externalForegroundApplicationSceneHandles"的那个。
+    for (NSString *key in @[@"_sceneManager", @"sceneManager",
+                            @"mainDisplaySceneManager", @"mainSceneManager",
+                            @"_mainDisplaySceneManager", @"_mainSceneManager"]) {
+        id m = ACKVC(coord, key);
+        if (m && [m respondsToSelector:fgSel]) return m;
+    }
+    return nil;
+}
+
 static NSSet *ACForegroundBundleIDsViaScenes(BOOL verbose)
 {
     id coord = ACSharedInstanceOf(@"SBSceneManagerCoordinator");
     if (!coord) { if (verbose) AC_LOG(@"检测: 没有 SBSceneManagerCoordinator"); return nil; }
 
-    id mgr = nil;
-    for (NSString *key in @[@"_sceneManager", @"sceneManager",
-                            @"mainDisplaySceneManager", @"mainSceneManager"]) {
-        mgr = ACKVC(coord, key);
-        if (mgr) break;
+    id mgr = ACGetSBSceneManager(coord);
+    if (!mgr) {
+        if (verbose) AC_LOG(@"检测: 拿不到带 externalForegroundApplicationSceneHandles 的 SBSceneManager");
+        return nil;
     }
-    if (!mgr) { if (verbose) AC_LOG(@"检测: 拿不到主屏 SBSceneManager"); return nil; }
+    if (verbose) AC_LOG(@"检测: 场景管理器 = %@", NSStringFromClass([mgr class]));
 
     id handles = ACKVC(mgr, @"externalForegroundApplicationSceneHandles");
     if (verbose) AC_LOG(@"检测: externalForegroundApplicationSceneHandles = %@",
@@ -821,20 +867,37 @@ static NSSet *ACForegroundBundleIDsViaScenes(BOOL verbose)
     NSMutableSet *bids = [NSMutableSet set];
     for (id handle in array) {
         if (verbose) AC_LOG(@"检测:   前台句柄 = %@", NSStringFromClass([handle class]));
+
+        // 提取 bundle id 的多条路径, 从最直接到最兜底:
+        //   1. handle.application.bundleIdentifier (SBApplicationSceneHandle.application)
+        //   2. handle.clientSettings.preferredSceneHostIdentifier (前台 app 场景的权威 host id)
+        //   3. handle.applicationProcess / processIdentity 链
+        id bid = nil;
+
         id app = ACKVC(handle, @"application");
         if (!app) app = ACKVC(handle, @"_application");
-        if (!app) {
+        if (app) bid = ACKVC(app, @"bundleIdentifier");
+
+        if (!bid || ![bid isKindOfClass:[NSString class]]) {
+            id cs = ACKVC(handle, @"clientSettings");
+            id host = ACKVC(cs, @"preferredSceneHostIdentifier");
+            if ([host isKindOfClass:[NSString class]]) bid = host;
+        }
+
+        if (!bid || ![bid isKindOfClass:[NSString class]]) {
             id scene = ACKVC(handle, @"sceneIfExists");
             if (!scene) scene = ACKVC(handle, @"scene");
-            if (scene) app = ACKVC(scene, @"application");
+            id sa = ACKVC(scene, @"application");
+            if (sa) bid = ACKVC(sa, @"bundleIdentifier");
         }
-        id bid = ACKVC(app, @"bundleIdentifier");
-        if (!bid) {
+
+        if (!bid || ![bid isKindOfClass:[NSString class]]) {
             id ident = ACKVC(handle, @"processIdentity");
             if (!ident) ident = ACKVC(app, @"processIdentity");
             bid = ACKVC(ident, @"bundleIdentifier");
         }
-        if (bid && [bid isKindOfClass:[NSString class]]) {
+
+        if (bid && [bid isKindOfClass:[NSString class]] && [bid length]) {
             [bids addObject:bid];
             if (verbose) AC_LOG(@"检测:   前台 bundle id = %@", bid);
         }
