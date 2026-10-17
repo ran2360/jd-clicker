@@ -52,14 +52,16 @@ jobs:
         run: |
           cp src/JDClickerSB.m     tweak/JDClickerSB.m
           cp src/JDClickerSB.plist tweak/JDClickerSB.plist
+          cp src/BBProbe.m         tweak/BBProbe.m
+          cp src/BBProbe.plist     tweak/BBProbe.plist
           VER="1.0.$((2000 + ${{ github.run_number }}))"
           sed -i '' "s/^Version:.*/Version: $VER/" tweak/control
           echo "本次构建版本号: $VER  (来自 run_number ${{ github.run_number }})"
           echo "--- tweak/control ---"
           cat tweak/control
           echo "--- 源码 ---"
-          ls -l tweak/JDClickerSB.m
-          shasum -a 256 src/JDClickerSB.m | tee hash.txt
+          ls -l tweak/*.m tweak/*.plist
+          shasum -a 256 src/*.m | tee hash.txt
 
       # theos 的 "Signing" 这一步要调用 ldid。macOS 上 install-theos 不一定带上它,
       # 实测日志里就是 "/bin/bash: ldid: command not found" 导致构建失败。
