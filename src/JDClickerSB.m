@@ -69,7 +69,6 @@ static NSString * const kACKeyFreq    = @"jd_freq";
 static NSString * const kACKeyBallX   = @"jd_ball_x";
 static NSString * const kACKeyBallY   = @"jd_ball_y";
 static NSString * const kACKeyAimed   = @"jd_aimed";
-static NSString * const kACKeyAlways  = @"jd_always_show";   // 无视前台 App 一直显示
 
 // ===========================================================================
 // MARK: - 日志 (写文件, Filza 直接可看)
@@ -708,8 +707,67 @@ static id ACTargetSBApplication(void)
                       @"applicationWithBundleIdentifier:", kJDTargetBundle);
 }
 
+// 通过 SBSceneManager.externalForegroundApplicationSceneHandles 拿到当前**前台**应用的
+// scene handle 集合, 逐个提取 bundle id。
+// 这是 iOS 16 上判断"前台应用"的权威来源 —— 实测 SBApplication.processState 返回的是
+// 十亿级别的指针/结构体 (不是小枚举), 那个路径根本不能用。
+static NSSet *ACForegroundBundleIDsViaScenes(BOOL verbose)
+{
+    id coord = ACSharedInstanceOf(@"SBSceneManagerCoordinator");
+    if (!coord) { if (verbose) AC_LOG(@"检测: 没有 SBSceneManagerCoordinator"); return nil; }
+
+    id mgr = nil;
+    for (NSString *key in @[@"mainDisplaySceneManager", @"mainSceneManager"]) {
+        mgr = ACKVC(coord, key);
+        if (mgr) break;
+    }
+    if (!mgr) { if (verbose) AC_LOG(@"检测: 拿不到主屏 SBSceneManager"); return nil; }
+
+    id handles = ACKVC(mgr, @"externalForegroundApplicationSceneHandles");
+    if (verbose) AC_LOG(@"检测: externalForegroundApplicationSceneHandles = %@",
+                        handles ? NSStringFromClass([handles class]) : @"nil");
+    if (!handles) return nil;
+
+    NSArray *array = handles;
+    if ([handles respondsToSelector:@selector(allObjects)]) {
+        array = [handles performSelector:@selector(allObjects)];
+    }
+    if (![array isKindOfClass:[NSArray class]]) return nil;
+
+    NSMutableSet *bids = [NSMutableSet set];
+    for (id handle in array) {
+        if (verbose) AC_LOG(@"检测:   前台句柄 = %@", NSStringFromClass([handle class]));
+        id app = ACKVC(handle, @"application");
+        if (!app) app = ACKVC(handle, @"_application");
+        if (!app) {
+            id scene = ACKVC(handle, @"sceneIfExists");
+            if (!scene) scene = ACKVC(handle, @"scene");
+            if (scene) app = ACKVC(scene, @"application");
+        }
+        id bid = ACKVC(app, @"bundleIdentifier");
+        if (!bid) {
+            id ident = ACKVC(handle, @"processIdentity");
+            if (!ident) ident = ACKVC(app, @"processIdentity");
+            bid = ACKVC(ident, @"bundleIdentifier");
+        }
+        if (bid && [bid isKindOfClass:[NSString class]]) {
+            [bids addObject:bid];
+            if (verbose) AC_LOG(@"检测:   前台 bundle id = %@", bid);
+        }
+    }
+    if (verbose) AC_LOG(@"检测: 前台应用 = %@", [bids allObjects]);
+    return bids;
+}
+
 static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
 {
+    // 首选: 场景句柄 (权威, 干净的是/否)
+    NSSet *fgbids = ACForegroundBundleIDsViaScenes(verbose);
+    if (fgbids) {
+        return [fgbids containsObject:kJDTargetBundle] ? ACFrontProbeYes : ACFrontProbeNo;
+    }
+
+    // 退回: SBApplicationController + processState (这台设备上 processState 是大数, 基本不可用)
     Class ctrlC = NSClassFromString(@"SBApplicationController");
     id ctrl = ACSharedInstanceOf(@"SBApplicationController");
     if (!ctrlC || !ctrl ||
@@ -915,7 +973,6 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
     UIButton            *_aimBtn;
     UIButton            *_startBtn;
     UISegmentedControl  *_freqCtrl;
-    UISegmentedControl  *_showCtrl;
     UIButton            *_confirmBtn;      // 瞄准时替代菜单的「确认」小按钮
     UILabel             *_statusLabel;
     ACCrosshairView     *_crosshair;
@@ -924,12 +981,9 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
     CGPoint              _point;
     BOOL                 _hasPoint;
     NSInteger            _freqIndex;
-    BOOL                 _alwaysShow;
     BOOL                 _targetFront;
     NSTimer             *_visTimer;
     NSInteger            _installRetry;
-    NSInteger            _blindTicks;      // 选了「仅京东显示」但一直检测不到前台的累计次数
-    BOOL                 _reportedUnknown; // 是否已经把"检测不可用"打进日志
     NSInteger            _tickCount;
     NSInteger            _lastTargetState; // 京东 processState 的上一个值 (用来发现变化)
 }
@@ -1049,10 +1103,12 @@ static UIWindowScene *ACAnyWindowScene(void)
 
     ACFrontProbe probe = ACProbeTargetFrontmost(NO);
     BOOL front = (probe == ACFrontProbeYes);
-    BOOL shouldShow = _alwaysShow || front;
 
-    // 记录京东 processState 的变化 —— 我们还不确定"前台"是哪个数值。
-    // 你只要开着京东待一会儿, 日志里就会出现它的真实值, 那就能把判定改对。
+    // 「仅京东显示」: 只有**确认**京东在前台时才显示;
+    // 检测手段不可用(未知)时**也显示**, 免得球藏起来后用户点不到它 (1.0.10 的教训)。
+    BOOL shouldShow = (probe != ACFrontProbeNo);
+
+    // 记录京东 processState 的变化 (旧检测方式的数据; 场景句柄不可用时还能用来兜底)
     {
         id app = ACTargetSBApplication();
         if (app) {
@@ -1074,38 +1130,6 @@ static UIWindowScene *ACAnyWindowScene(void)
                probe == ACFrontProbeYes ? @"是" :
                (probe == ACFrontProbeNo ? @"否" : @"未知"));
         [self refreshUI];
-    }
-
-    // ---- 安全网 ----
-    // 用户选了「仅京东显示」, 但前台检测一次都没成功 -> 球会永远藏起来,
-    // 而用户点不到一个看不见的球, 就被锁在外面了 (1.0.10 实测踩到过这个坑)。
-    // 所以: 连续 20 秒检测不到就自动切回「总是显示」, 并把原因写进日志。
-    if (!_alwaysShow) {
-        if (front) {
-            _blindTicks = 0;
-        } else {
-            _blindTicks++;
-            if (probe == ACFrontProbeUnknown && !_reportedUnknown) {
-                _reportedUnknown = YES;
-                AC_LOG(@"注意: 前台检测返回「未知」—— 查不到 %@ 的 app 对象。", kJDTargetName);
-                AC_LOG(@"      这通常意味着 bundle id 不对, 或 SpringBoard 的 API 变了;");
-                AC_LOG(@"      请看上面那份「前台检测诊断」里列出的已知应用清单。");
-            }
-            if (_blindTicks == 34) {     // ≈10s
-                AC_LOG(@"提示: 已 10 秒未检测到 %@ 在前台 (累计 %ld 次)", kJDTargetName, (long)_blindTicks);
-            }
-            if (_blindTicks >= 67) {     // ≈20s
-                AC_LOG(@"!! 连续 20 秒没能确认 %@ 在前台, 自动切回「总是显示」", kJDTargetName);
-                AC_LOG(@"!! 否则悬浮球会一直藏着而你点不到它。若这不符合预期, 说明前台检测在这台设备上不工作, 请把日志发我。");
-                _alwaysShow = YES;
-                _blindTicks = 0;
-                NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-                [d setBool:YES forKey:kACKeyAlways];
-                [d synchronize];
-                [self refreshUI];
-                shouldShow = YES;
-            }
-        }
     }
 
     BOOL wantHidden = !shouldShow;
@@ -1165,7 +1189,7 @@ static UIWindowScene *ACAnyWindowScene(void)
 {
     CGFloat w = kACMenuWidth;
     // 去掉「派发方式」那一行后, 高度相应减掉 38
-    CGFloat h = 10 + 40 + 6 + 40 + 6 + 32 + 6 + 32 + 6 + 78 + 10;   // 266
+    CGFloat h = 10 + 40 + 6 + 40 + 6 + 32 + 6 + 78 + 10;   // 228
 
     _menu = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, h)];
     _menu.backgroundColor = [UIColor colorWithWhite:0.12 alpha:0.94];
@@ -1191,16 +1215,7 @@ static UIWindowScene *ACAnyWindowScene(void)
     [_freqCtrl addTarget:self action:@selector(onFreqChanged:) forControlEvents:UIControlEventValueChanged];
     [_menu addSubview:_freqCtrl];
 
-    _showCtrl = [[UISegmentedControl alloc] initWithItems:@[@"仅京东显示", @"总是显示"]];
-    _showCtrl.frame = CGRectMake(10, 140, w - 20, 32);
-    _showCtrl.selectedSegmentIndex = _alwaysShow ? 1 : 0;
-    if (@available(iOS 13.0, *)) {
-        _showCtrl.selectedSegmentTintColor = [UIColor colorWithRed:0.55 green:0.35 blue:0.85 alpha:1.0];
-    }
-    [_showCtrl addTarget:self action:@selector(onShowChanged:) forControlEvents:UIControlEventValueChanged];
-    [_menu addSubview:_showCtrl];
-
-    _statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 178, w - 24, 78)];
+    _statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 140, w - 24, 78)];
     _statusLabel.numberOfLines = 6;
     _statusLabel.font = [UIFont systemFontOfSize:9.5];
     _statusLabel.textColor = [UIColor colorWithWhite:0.85 alpha:1.0];
@@ -1210,7 +1225,7 @@ static UIWindowScene *ACAnyWindowScene(void)
 }
 
 // 瞄准时用的「确认」小按钮: 面板收起后, 这是唯一还能点确认的地方。
-// 放在屏幕底部中间, 一般不会挡住要瞄准的位置。
+// 默认放屏幕底部中间, 并且**可以拖动** —— 免得它正好挡住要瞄准的位置。
 - (void)buildConfirmButton
 {
     _confirmBtn = [self makeButtonWithTitle:@"确认" action:@selector(onConfirmTapped:)];
@@ -1219,7 +1234,18 @@ static UIWindowScene *ACAnyWindowScene(void)
     CGSize sb = _window.bounds.size;
     _confirmBtn.center = CGPointMake(sb.width * 0.5, sb.height - 80);
     _confirmBtn.hidden = YES;
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onConfirmPan:)];
+    [_confirmBtn addGestureRecognizer:pan];
     [_window addSubview:_confirmBtn];
+}
+
+- (void)onConfirmPan:(UIPanGestureRecognizer *)g
+{
+    CGPoint t = [g translationInView:_window];
+    _confirmBtn.center = [self clampPoint:CGPointMake(_confirmBtn.center.x + t.x,
+                                                       _confirmBtn.center.y + t.y)
+                                   forSize:_confirmBtn.bounds.size];
+    [g setTranslation:CGPointZero inView:_window];
 }
 
 - (void)buildCrosshair
@@ -1265,13 +1291,6 @@ static UIWindowScene *ACAnyWindowScene(void)
     for (NSInteger i = 0; i < (NSInteger)presets.count; i++) {
         if (fabs(presets[i].doubleValue - f) < 0.01) { _freqIndex = i; break; }
     }
-
-    // 首次运行默认「总是显示」。
-    // 原因: 如果前台检测在某个 iOS 版本上不灵, 悬浮球会一直藏起来,
-    // 而用户没法点到一个看不见的球去改成「总是显示」—— 死锁。
-    // 所以先让它一定能看见, 用户确认检测灵了之后再自己切成「仅京东显示」。
-    id alwaysPref = [d objectForKey:kACKeyAlways];
-    _alwaysShow = (alwaysPref == nil) ? YES : [d boolForKey:kACKeyAlways];
 }
 
 - (void)savePoint
@@ -1413,7 +1432,12 @@ static UIWindowScene *ACAnyWindowScene(void)
 {
     ACClickEngine *eng = [ACClickEngine shared];
 
-    if (eng.running) { [eng stop]; [self refreshUI]; return; }
+    if (eng.running) {
+        [eng stop];
+        _menu.hidden = YES;              // 停止后也把面板收起来, 保持屏幕干净
+        [self refreshUI];
+        return;
+    }
 
     if (!_hasPoint) { AC_LOG(@"尚未保存准星坐标, 请先「瞄准」->「确认」"); [self refreshUI]; return; }
 
@@ -1444,6 +1468,7 @@ static UIWindowScene *ACAnyWindowScene(void)
     eng.point = _point;
     eng.frequency = [self currentFrequency];
     [eng start];
+    _menu.hidden = YES;                  // ★ 开始后收起面板, 不挡连点区域
     [self refreshUI];
 }
 
@@ -1454,16 +1479,6 @@ static UIWindowScene *ACAnyWindowScene(void)
     ACClickEngine *eng = [ACClickEngine shared];
     eng.frequency = [self currentFrequency];
     if (eng.running) { [eng stop]; [eng start]; }
-    [self refreshUI];
-}
-
-- (void)onShowChanged:(UISegmentedControl *)c
-{
-    _alwaysShow = (c.selectedSegmentIndex == 1);
-    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    [d setBool:_alwaysShow forKey:kACKeyAlways];
-    [d synchronize];
-    AC_LOG(@"显示模式: %@", _alwaysShow ? @"总是显示" : @"仅京东前台时显示");
     [self refreshUI];
 }
 
@@ -1507,7 +1522,6 @@ static UIWindowScene *ACAnyWindowScene(void)
         : [UIColor colorWithRed:0.16 green:0.46 blue:0.30 alpha:1.0];
 
     _freqCtrl.selectedSegmentIndex = _freqIndex;
-    _showCtrl.selectedSegmentIndex = _alwaysShow ? 1 : 0;
 
     _statusLabel.text = [NSString stringWithFormat:
         @"坐标 %.0f, %.0f %@ | 频率 %.0f/s\n状态: %@\n%@: %@\n派发: %@\nHID: %@",
