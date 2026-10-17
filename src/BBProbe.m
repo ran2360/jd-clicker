@@ -211,6 +211,34 @@ static void BBProbeEntitlements(void)
 }
 
 // ---------------------------------------------------------------------------
+// 坐标单位 —— 这是本轮要验证的核心
+// ---------------------------------------------------------------------------
+// 之前所有测试都传"点" (430x932)。但 IOHID 的 digitizer 也有可能期望的是
+// **物理像素** (1290x2796)。两种解释和"什么都没发生"都完全吻合:
+//
+//   * 点 Dock 图标 (55, 850)
+//       按点   -> 就是 Dock 第一个图标 -> 应该打开 App
+//       按像素 -> 实际落在 (18, 283) 点 = 屏幕左侧中上部空白 -> 什么都没有
+//   * 顶部下滑 (215,3)->(215,620)
+//       按点   -> 一整段下滑 -> 应该拉出通知中心
+//       按像素 -> 只有左上角一小段 (72,1)->(72,207) -> 什么都不会发生
+//
+// 所以这一轮把两种单位各测一遍, 一次性定性。
+static CGFloat BBScreenScale(void)
+{
+    @try {
+        CGFloat s = [UIScreen mainScreen].scale;
+        if (s > 0) return s;
+    } @catch (NSException *e) { }
+    return 3.0;                      // iPhone 14 Pro Max
+}
+
+static CGPoint BBScaled(CGPoint p, BOOL pixels, CGFloat scale)
+{
+    return pixels ? CGPointMake(p.x * scale, p.y * scale) : p;
+}
+
+// ---------------------------------------------------------------------------
 // 派发动作
 // ---------------------------------------------------------------------------
 static IOHIDEventSystemClientRef BBMakeClient(int kind)
@@ -275,37 +303,45 @@ static void BBProbeInit(void)
 
     if (!pDispatch) { BBLog(@"没有 dispatch 符号, 放弃"); return; }
 
-    // 四轮, 每轮换一种 client 类型, 且都用**必然可见**的动作:
-    //   第 1 轮: 点左下角 Dock 图标 -> 会打开一个 App
-    //   第 2~4 轮: 从屏幕顶部下滑 -> 会拉出通知中心 (结果会留在屏幕上)
+    CGFloat scale = BBScreenScale();
+    BBLog(@"屏幕缩放 = %.1f  (点是 430x932, 像素是 %.0fx%.0f)",
+          scale, 430 * scale, 932 * scale);
+
+    // 四轮, 每轮都用**必然可见**的动作 + 换坐标单位:
+    //   第 1 轮 点 Dock 图标 · 单位=点
+    //   第 2 轮 点 Dock 图标 · 单位=像素   <- 如果只有这轮有反应, 说明坐标要用像素
+    //   第 3 轮 顶部下滑   · 单位=点
+    //   第 4 轮 顶部下滑   · 单位=像素
     //
-    // 为什么不用"点屏幕中心": 桌面中心本来就是空白, 点一下毫无反应 ——
-    // 上一版就是这么测的, 结论完全无效。这是那一轮的教训。
+    // 用"点 Dock 图标"(会开 App) 和"顶部下滑"(会拉通知中心) 当作判据, 是因为
+    // 它们的结果肉眼必然可见、而且事后还能查。上一版用"点屏幕中心"完全无效 ——
+    // 桌面中心本来就是空白, 点一下就什么都不会发生, 那个结论毫无意义。
     for (int round = 0; round < 4; round++) {
-        int kind = (round == 0) ? 2 : (round == 1 ? 2 : (round == 2 ? 0 : 1));
-        const char *kindName = (kind == 1) ? "Admin(1)" : (kind == 2 ? "System(5)" : "Create");
+        BOOL pixels = (round % 2) == 1;         // 1、3 轮用像素
+        BOOL dockTap = (round < 2);             // 前两轮点 Dock, 后两轮下滑
 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((20 + round * 20) * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             @autoreleasepool {
-                IOHIDEventSystemClientRef c = BBMakeClient(kind);
-                BBLog(@"---------- 第 %d 轮 (client=%s) ----------", round + 1, kindName);
+                IOHIDEventSystemClientRef c = BBMakeClient(2);      // System(5)
+                BBLog(@"---------- 第 %d 轮  坐标单位=%@ ----------",
+                      round + 1, pixels ? @"像素" : @"点");
                 BBLog(@"client = %@", c ? @"建好" : @"失败");
                 if (!c) return;
 
-                if (round == 0) {
-                    // 左下角 Dock 第一个图标 (430x932 屏, Dock 在屏幕底部)
-                    CGPoint p = CGPointMake(55, 850);
-                    BBLog(@"动作: 点 (%.0f, %.0f) 三次 —— 如果派发成功, 应该会打开一个 App", p.x, p.y);
+                if (dockTap) {
+                    CGPoint p = BBScaled(CGPointMake(55, 850), pixels, scale);
+                    BBLog(@"动作: 点 (%.0f, %.0f) 三次 —— 成功的话应该会打开 Dock 第一个 App",
+                          p.x, p.y);
                     BBTap(c, p, 3);
-                    BBLog(@"已派发 3 次点击。★ 屏幕上有 App 被打开吗?");
+                    BBLog(@"已派发。★ 有 App 自己打开吗?");
                 } else {
-                    CGPoint from = CGPointMake(215, 3);      // 屏幕最顶部
-                    CGPoint to   = CGPointMake(215, 620);
-                    BBLog(@"动作: 从 (%.0f, %.0f) 下滑到 (%.0f, %.0f) —— 如果派发成功, 应该会拉出通知中心",
+                    CGPoint from = BBScaled(CGPointMake(215, 3), pixels, scale);
+                    CGPoint to   = BBScaled(CGPointMake(215, 620), pixels, scale);
+                    BBLog(@"动作: 从 (%.0f, %.0f) 滑到 (%.0f, %.0f) —— 成功的话应该拉出通知中心",
                           from.x, from.y, to.x, to.y);
                     BBSwipe(c, from, to, 30);
-                    BBLog(@"已派发滑动。★ 屏幕顶部有通知中心出现吗? (它会一直留着)");
+                    BBLog(@"已派发。★ 通知中心被拉出来了吗? (它会一直留着)");
                 }
             }
         });
