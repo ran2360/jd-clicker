@@ -237,7 +237,7 @@ jobs:
           cd tweak
           if ls packages/*.deb >/dev/null 2>&1; then
             cd ..
-            python3 tools/make_repo.py --debs "tweak/packages/*.deb" --out repo
+            python3 tools/make_repo.py --debs "tweak/packages/*.deb" --out repo --clean
             git config user.name  "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add repo/ tools/make_repo.py

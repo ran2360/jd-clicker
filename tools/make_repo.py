@@ -157,6 +157,8 @@ def main():
     ap.add_argument("--out", required=True, help="源目录 (会创建)")
     ap.add_argument("--no-copy", action="store_true",
                     help="不复制 deb (deb 已经在 out 里), 只生成索引")
+    ap.add_argument("--clean", action="store_true",
+                    help="删除 out 目录里所有旧 *.deb (只保留本次 --debs 命中的版本)")
     a = ap.parse_args()
 
     # 展开 glob
@@ -172,6 +174,17 @@ def main():
 
     os.makedirs(a.out, exist_ok=True)
     out_abs = os.path.abspath(a.out)
+
+    # 清理旧版本 deb, 只保留本次要发布的 (防止 repo/ 里越积越多)
+    if a.clean:
+        want_bases = {os.path.basename(p) for p in deb_paths}
+        removed = 0
+        for name in sorted(os.listdir(out_abs)):
+            if name.endswith(".deb") and name not in want_bases:
+                os.remove(os.path.join(out_abs, name))
+                removed += 1
+        if removed:
+            print(f"清理旧 deb: {removed} 个")
 
     # 复制 deb 到源目录, 并记录 (相对文件名, 绝对路径)
     entries = []
