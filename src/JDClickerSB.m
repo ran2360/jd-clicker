@@ -70,7 +70,6 @@ static NSString * const kACKeyBallX   = @"jd_ball_x";
 static NSString * const kACKeyBallY   = @"jd_ball_y";
 static NSString * const kACKeyAimed   = @"jd_aimed";
 static NSString * const kACKeyAlways  = @"jd_always_show";   // 无视前台 App 一直显示
-static NSString * const kACKeyMethod  = @"jd_method";        // 派发方式 0..3
 
 // ===========================================================================
 // MARK: - 日志 (写文件, Filza 直接可看)
@@ -173,31 +172,10 @@ static ACSystemClientCreateWithTypeFn   pClientCreateWithType = NULL;
 static ACSystemClientCreateSimpleFn     pClientCreateSimple   = NULL;
 static ACSystemClientDispatchFn         pSystemClientDispatch = NULL;
 
-// 给合成事件打的 sender id。实测发现这可能是"事件被丢弃"的原因之一,
-// 所以它现在是可选的 —— 见 ACTouchInjector 的四种方式。
+// 给合成事件打的 sender id。实测方式1 (IOHIDEventSystemClientCreate + 这个固定
+// senderID) 是唯一能真正点中屏幕的组合 —— 其它 client 类型/不带 senderID 都不行,
+// 所以现在**只保留这一种**, 不再做可切换的菜单。
 static const uint64_t kACSyntheticSenderID = 0x8000000817319372ULL;
-
-// ---------------------------------------------------------------------------
-// 四种派发方式
-// ---------------------------------------------------------------------------
-// 为什么要有四种: 实测「开始连点」跑起来但京东毫无反应。可能性有好几个 --
-// 事件构造不对 / client 类型不对 / sender id 让系统不认 / 权限被拦。
-// 光靠猜没法区分, 所以做成可切换的, 你在菜单里一种一种试。
-typedef struct {
-    const char *name;      // 菜单上显示的短名
-    const char *detail;    // 日志里的完整说明
-    int         clientKind; // 0=Create 1=CreateWithType(Admin) 2=CreateWithType(System) 3=CreateSimpleClient
-    BOOL        useSenderID;
-} ACDispatchMethod;
-
-static const ACDispatchMethod kACMethods[] = {
-    { "1", "Create + senderID",                                 0, YES },
-    { "2", "CreateWithType(Admin=1) + senderID",                1, YES },
-    { "3", "CreateWithType(Admin=1) 不带 senderID",             1, NO  },
-    { "4", "CreateWithType(System=5) 不带 senderID",            2, NO  },
-    { "5", "CreateSimpleClient 不带 senderID",                  3, NO  },
-};
-static const int kACMethodCount = (int)(sizeof(kACMethods) / sizeof(kACMethods[0]));
 
 static void ACLoadIOHIDSymbols(void)
 {
@@ -325,7 +303,6 @@ static IOHIDEventRef ACCreateHIDEvent(CGPoint point, UITouchPhase phase, BOOL us
 @property (nonatomic, assign, readonly) BOOL ready;
 @property (nonatomic, readonly) NSString *diagnostics;
 @property (nonatomic, readonly) NSString *clientKind;
-@property (nonatomic, assign) NSInteger methodIndex;   // 0..kACMethodCount-1
 + (instancetype)shared;
 - (void)prepare;
 - (void)tapAtPoint:(CGPoint)point;
@@ -355,35 +332,19 @@ static IOHIDEventRef ACCreateHIDEvent(CGPoint point, UITouchPhase phase, BOOL us
     return [NSString stringWithFormat:@"已就绪 / %@", self.clientKind];
 }
 
-// 按当前 methodIndex 建一个 client。四种方式见 kACMethods 的表。
+// 只建一种 client: IOHIDEventSystemClientCreate + 固定 senderID。
+// 这是实测唯一能真正点中屏幕的组合, 所以不再做可切换的多种方式。
 - (void)buildClient
 {
     ACLoadIOHIDSymbols();
     _client = NULL;
-    int kind = kACMethods[MAX(0, MIN(_methodIndex, kACMethodCount - 1))].clientKind;
+    _clientKind = @"IOHIDEventSystemClientCreate + 固定 senderID";
 
-    if (kind == 0 && pSystemClientCreate) {
+    if (pSystemClientCreate) {
         _client = pSystemClientCreate(kCFAllocatorDefault);
-    } else if (kind == 1 && pClientCreateWithType) {
-        _client = pClientCreateWithType(kCFAllocatorDefault, 1 /* Admin */, NULL);
-    } else if (kind == 2 && pClientCreateWithType) {
-        _client = pClientCreateWithType(kCFAllocatorDefault, 5 /* System */, NULL);
-    } else if (kind == 3 && pClientCreateSimple) {
-        _client = pClientCreateSimple(kCFAllocatorDefault);
     }
-    // 该方式需要的符号不存在时, 退回到最基础的 Create, 免得完全不能用
-    if (_client == NULL && pSystemClientCreate) {
-        _client = pSystemClientCreate(kCFAllocatorDefault);
-        _clientKind = [NSString stringWithFormat:@"方式%ld 的符号缺失, 回退到 Create",
-                       (long)_methodIndex + 1];
-    } else {
-        _clientKind = [NSString stringWithFormat:@"方式%ld: %s",
-                       (long)_methodIndex + 1, kACMethods[MAX(0, MIN(_methodIndex, kACMethodCount - 1))].detail];
-    }
-
     BOOL ok = self.ready;
-    AC_LOG(@"注入器: ready=%@  方式%ld  ->  %@",
-           ok ? @"YES" : @"NO", (long)_methodIndex + 1, _clientKind);
+    AC_LOG(@"注入器: ready=%@  ->  %@", ok ? @"YES" : @"NO", _clientKind);
 }
 
 - (void)prepare
@@ -402,31 +363,29 @@ static IOHIDEventRef ACCreateHIDEvent(CGPoint point, UITouchPhase phase, BOOL us
 {
     if (!self.ready) return;
 
-    BOOL useSender = kACMethods[MAX(0, MIN(_methodIndex, kACMethodCount - 1))].useSenderID;
     _dispatchCount++;
 
     @try {
         // 按下 -> 移动 -> 抬起, 各隔 50ms。
         // 直接把按下/抬起背靠背派发, 会被系统在 UIKit 处理之前合并掉 (ios-mcp 的结论)。
-        IOHIDEventRef began = ACCreateHIDEvent(point, UITouchPhaseBegan, useSender);
+        IOHIDEventRef began = ACCreateHIDEvent(point, UITouchPhaseBegan, YES);
         if (began) { pSystemClientDispatch(_client, began); CFRelease(began); }
         usleep(50 * 1000);
 
-        IOHIDEventRef moved = ACCreateHIDEvent(point, UITouchPhaseMoved, useSender);
+        IOHIDEventRef moved = ACCreateHIDEvent(point, UITouchPhaseMoved, YES);
         if (moved) { pSystemClientDispatch(_client, moved); CFRelease(moved); }
         usleep(50 * 1000);
 
-        IOHIDEventRef ended = ACCreateHIDEvent(point, UITouchPhaseEnded, useSender);
+        IOHIDEventRef ended = ACCreateHIDEvent(point, UITouchPhaseEnded, YES);
         if (ended) { pSystemClientDispatch(_client, ended); CFRelease(ended); }
 
         if (_dispatchCount <= 4) {
             CGSize sz = ACScreenFixedSize();
-            AC_LOG(@"派发 #%ld: 点=(%.0f, %.0f) 归一化=(%.4f, %.4f) 屏=%.0fx%.0f senderID=%@ began/moved/ended=%@/%@/%@ client=%@",
+            AC_LOG(@"派发 #%ld: 点=(%.0f, %.0f) 归一化=(%.4f, %.4f) 屏=%.0fx%.0f began/moved/ended=%@/%@/%@ client=%@",
                    (long)_dispatchCount, point.x, point.y,
                    sz.width > 0 ? point.x / sz.width : 0.0,
                    sz.height > 0 ? point.y / sz.height : 0.0,
                    sz.width, sz.height,
-                   useSender ? @"带" : @"不带",
                    began ? @"建好" : @"失败", moved ? @"建好" : @"失败", ended ? @"建好" : @"失败",
                    self.clientKind);
         }
@@ -957,7 +916,7 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
     UIButton            *_startBtn;
     UISegmentedControl  *_freqCtrl;
     UISegmentedControl  *_showCtrl;
-    UISegmentedControl  *_methodCtrl;
+    UIButton            *_confirmBtn;      // 瞄准时替代菜单的「确认」小按钮
     UILabel             *_statusLabel;
     ACCrosshairView     *_crosshair;
 
@@ -966,7 +925,6 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
     BOOL                 _hasPoint;
     NSInteger            _freqIndex;
     BOOL                 _alwaysShow;
-    NSInteger            _methodIndex;
     BOOL                 _targetFront;
     NSTimer             *_visTimer;
     NSInteger            _installRetry;
@@ -994,11 +952,6 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
 
     _lastTargetState = NSIntegerMin;    // 保证第一次读到就记一条变化
     [self loadPrefs];
-
-    // ★ 必须在第一次 prepare 之前把「派发方式」同步给注入器 ★
-    //   之前漏了这一步: 界面上的 _methodIndex 会变, 但注入器里那份永远是 0,
-    //   于是用户切换 5 次, 建的 5 个 client 其实全是「方式1」。
-    [ACTouchInjector shared].methodIndex = _methodIndex;
     [[ACTouchInjector shared] prepare];
 
     ACClickEngine *eng = [ACClickEngine shared];
@@ -1065,6 +1018,7 @@ static UIWindowScene *ACAnyWindowScene(void)
     _window = win;
     [self buildBall];
     [self buildMenu];
+    [self buildConfirmButton];
     [self buildCrosshair];
     [self refreshUI];
 
@@ -1210,7 +1164,8 @@ static UIWindowScene *ACAnyWindowScene(void)
 - (void)buildMenu
 {
     CGFloat w = kACMenuWidth;
-    CGFloat h = 10 + 40 + 6 + 40 + 6 + 32 + 6 + 32 + 6 + 32 + 6 + 78 + 10;   // 304
+    // 去掉「派发方式」那一行后, 高度相应减掉 38
+    CGFloat h = 10 + 40 + 6 + 40 + 6 + 32 + 6 + 32 + 6 + 78 + 10;   // 266
 
     _menu = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, h)];
     _menu.backgroundColor = [UIColor colorWithWhite:0.12 alpha:0.94];
@@ -1245,27 +1200,26 @@ static UIWindowScene *ACAnyWindowScene(void)
     [_showCtrl addTarget:self action:@selector(onShowChanged:) forControlEvents:UIControlEventValueChanged];
     [_menu addSubview:_showCtrl];
 
-    // 派发方式: 用来试出哪种 IOHID client / 是否带 senderID 才能真正打到京东
-    NSMutableArray *names = [NSMutableArray array];
-    for (int i = 0; i < kACMethodCount; i++) {
-        [names addObject:[NSString stringWithUTF8String:kACMethods[i].name]];
-    }
-    _methodCtrl = [[UISegmentedControl alloc] initWithItems:names];
-    _methodCtrl.frame = CGRectMake(10, 178, w - 20, 32);
-    _methodCtrl.selectedSegmentIndex = _methodIndex;
-    if (@available(iOS 13.0, *)) {
-        _methodCtrl.selectedSegmentTintColor = [UIColor colorWithRed:0.92 green:0.42 blue:0.16 alpha:1.0];
-    }
-    [_methodCtrl addTarget:self action:@selector(onMethodChanged:) forControlEvents:UIControlEventValueChanged];
-    [_menu addSubview:_methodCtrl];
-
-    _statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 216, w - 24, 78)];
+    _statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 178, w - 24, 78)];
     _statusLabel.numberOfLines = 6;
     _statusLabel.font = [UIFont systemFontOfSize:9.5];
     _statusLabel.textColor = [UIColor colorWithWhite:0.85 alpha:1.0];
     [_menu addSubview:_statusLabel];
 
     [_window addSubview:_menu];
+}
+
+// 瞄准时用的「确认」小按钮: 面板收起后, 这是唯一还能点确认的地方。
+// 放在屏幕底部中间, 一般不会挡住要瞄准的位置。
+- (void)buildConfirmButton
+{
+    _confirmBtn = [self makeButtonWithTitle:@"确认" action:@selector(onConfirmTapped:)];
+    _confirmBtn.backgroundColor = [UIColor colorWithRed:0.95 green:0.55 blue:0.10 alpha:0.95];
+    _confirmBtn.frame = CGRectMake(0, 0, 100, 44);
+    CGSize sb = _window.bounds.size;
+    _confirmBtn.center = CGPointMake(sb.width * 0.5, sb.height - 80);
+    _confirmBtn.hidden = YES;
+    [_window addSubview:_confirmBtn];
 }
 
 - (void)buildCrosshair
@@ -1318,12 +1272,6 @@ static UIWindowScene *ACAnyWindowScene(void)
     // 所以先让它一定能看见, 用户确认检测灵了之后再自己切成「仅京东显示」。
     id alwaysPref = [d objectForKey:kACKeyAlways];
     _alwaysShow = (alwaysPref == nil) ? YES : [d boolForKey:kACKeyAlways];
-
-    // ★ 派发方式: 固定用方式1 (IOHIDEventSystemClientCreate + 固定 senderID)。
-    //   实测这是唯一能真正点中屏幕的方式 (方式2~5 都不行), 所以不再读持久化的
-    //   jd_method —— 设备上之前残留的"方式5"会导致点击无效, 这里强制回到方式1。
-    _methodIndex = 0;
-    if (_methodIndex < 0 || _methodIndex >= kACMethodCount) _methodIndex = 0;
 }
 
 - (void)savePoint
@@ -1406,8 +1354,18 @@ static UIWindowScene *ACAnyWindowScene(void)
 
 - (void)onBallTap:(UITapGestureRecognizer *)g
 {
-    _menu.hidden = !_menu.hidden;
-    if (!_menu.hidden) [self positionMenu];
+    if (_aiming) {
+        // 瞄准中再点球 = 取消瞄准
+        _aiming = NO;
+        _crosshair.hidden = YES;
+        _confirmBtn.hidden = YES;
+        _menu.hidden = NO;
+        [self positionMenu];
+        AC_LOG(@"已取消瞄准");
+    } else {
+        _menu.hidden = !_menu.hidden;
+        if (!_menu.hidden) [self positionMenu];
+    }
     [self refreshUI];
 }
 
@@ -1425,19 +1383,29 @@ static UIWindowScene *ACAnyWindowScene(void)
 - (void)onAimTapped:(UIButton *)b
 {
     if ([ACClickEngine shared].running) { AC_LOG(@"请先停止连点再瞄准"); [self refreshUI]; return; }
-    if (!_aiming) {
-        _aiming = YES;
-        _crosshair.hidden = NO;
-        _crosshair.center = [self clampPoint:_point forSize:_crosshair.bounds.size];
-        AC_LOG(@"进入瞄准模式: 拖动准星到目标位置后点「确认」");
-    } else {
-        _point = _crosshair.center;
-        [self savePoint];
-        [ACClickEngine shared].point = _point;
-        _aiming = NO;
-        _crosshair.hidden = YES;
-        AC_LOG(@"已保存点击坐标: (%.0f, %.0f)", _point.x, _point.y);
-    }
+    if (_aiming) return;
+
+    _aiming = YES;
+    _crosshair.hidden = NO;
+    _crosshair.center = [self clampPoint:_point forSize:_crosshair.bounds.size];
+    _menu.hidden = YES;               // ★ 收起面板, 不挡视野
+    _confirmBtn.hidden = NO;          // ★ 用屏幕底部的小「确认」按钮来确认
+    AC_LOG(@"进入瞄准模式: 面板已收起, 拖动准星后点底部「确认」(点悬浮球可取消)");
+    [self refreshUI];
+}
+
+- (void)onConfirmTapped:(UIButton *)b
+{
+    if (!_aiming) return;
+    _point = _crosshair.center;
+    [self savePoint];
+    [ACClickEngine shared].point = _point;
+    _aiming = NO;
+    _crosshair.hidden = YES;
+    _confirmBtn.hidden = YES;
+    AC_LOG(@"已保存点击坐标: (%.0f, %.0f)", _point.x, _point.y);
+    _menu.hidden = NO;                // 确认后重新打开菜单, 方便直接点「开始」
+    [self positionMenu];
     [self refreshUI];
 }
 
@@ -1476,31 +1444,6 @@ static UIWindowScene *ACAnyWindowScene(void)
     eng.point = _point;
     eng.frequency = [self currentFrequency];
     [eng start];
-    [self refreshUI];
-}
-
-- (void)onMethodChanged:(UISegmentedControl *)c
-{
-    _methodIndex = c.selectedSegmentIndex;
-    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    [d setInteger:_methodIndex forKey:kACKeyMethod];
-    [d synchronize];
-
-    ACClickEngine *eng = [ACClickEngine shared];
-    BOOL wasRunning = eng.running;
-    if (wasRunning) [eng stop];
-
-    // ★ 这里曾经漏了一行, 导致 5 种方式实际跑的全是「方式1」★
-    //   methodIndex 存了两份 (界面一份、注入器一份), 只改了界面那份。
-    ACTouchInjector *inj = [ACTouchInjector shared];
-    inj.methodIndex = _methodIndex;
-    [inj prepare];                            // 按新方式重建 client
-
-    AC_LOG(@"切换派发方式 -> 方式%ld   (注入器实际 methodIndex=%ld, client=%@)",
-           (long)_methodIndex + 1, (long)inj.methodIndex, inj.clientKind);
-    AC_LOG(@"  提示: 换方式后请到 SpringBoard 桌面把准星对准一个 App 图标试点击 ——");
-    AC_LOG(@"  那里能最直接地看出 HID 派发到底通不通 (图标被点开 = 通了)。");
-    if (wasRunning) [eng start];
     [self refreshUI];
 }
 
@@ -1552,7 +1495,8 @@ static UIWindowScene *ACAnyWindowScene(void)
         : [UIColor colorWithWhite:1.0 alpha:0.75]).CGColor;
     _ballLabel.text = running ? @"停" : @"连点";
 
-    [_aimBtn setTitle:(_aiming ? @"确认" : @"瞄准") forState:UIControlStateNormal];
+    // 瞄准按钮始终是「瞄准」; 确认的动作现在由瞄准模式下底部的小按钮完成
+    [_aimBtn setTitle:@"瞄准" forState:UIControlStateNormal];
     _aimBtn.backgroundColor = _aiming
         ? [UIColor colorWithRed:0.95 green:0.55 blue:0.10 alpha:1.0]
         : [UIColor colorWithWhite:0.28 alpha:1.0];
@@ -1564,7 +1508,6 @@ static UIWindowScene *ACAnyWindowScene(void)
 
     _freqCtrl.selectedSegmentIndex = _freqIndex;
     _showCtrl.selectedSegmentIndex = _alwaysShow ? 1 : 0;
-    _methodCtrl.selectedSegmentIndex = _methodIndex;
 
     _statusLabel.text = [NSString stringWithFormat:
         @"坐标 %.0f, %.0f %@ | 频率 %.0f/s\n状态: %@\n%@: %@\n派发: %@\nHID: %@",
