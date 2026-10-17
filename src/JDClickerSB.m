@@ -42,6 +42,7 @@
 #import <dlfcn.h>
 #import <mach/mach_time.h>
 #include <string.h>
+#include <unistd.h>
 
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
@@ -142,15 +143,19 @@ typedef IOHIDEventRef (*ACCreateDigitizerEventFn)(CFAllocatorRef, ACAbsoluteTime
                                                   IOHIDFloat, IOHIDFloat, IOHIDFloat,
                                                   IOHIDFloat, IOHIDFloat,
                                                   Boolean, Boolean, uint32_t);
-typedef IOHIDEventRef (*ACCreateFingerEventWithQualityFn)(CFAllocatorRef, ACAbsoluteTime,
-                                                          uint32_t, uint32_t, uint32_t,
-                                                          IOHIDFloat, IOHIDFloat, IOHIDFloat,
-                                                          IOHIDFloat, IOHIDFloat,
-                                                          IOHIDFloat, IOHIDFloat, IOHIDFloat,
-                                                          IOHIDFloat, IOHIDFloat,
-                                                          Boolean, Boolean, uint32_t);
-typedef void (*ACEventAppendEventFn)(IOHIDEventRef, IOHIDEventRef);
+// 手指事件 —— ★ 必须用 13 参数的 IOHIDEventCreateDigitizerFingerEvent,
+//   不是 ...WithQuality。这是我之前(以及 BBProbe)用错的地方之一:
+//   参数个数、字段、坐标含义都不同, 导致事件被系统直接丢弃。
+typedef IOHIDEventRef (*ACCreateFingerEventFn)(CFAllocatorRef, ACAbsoluteTime,
+                                               uint32_t, uint32_t, uint32_t,
+                                               IOHIDFloat, IOHIDFloat, IOHIDFloat,
+                                               IOHIDFloat, IOHIDFloat,
+                                               Boolean, Boolean, uint32_t);
+// AppendEvent 其实是 3 参数的 (第三个是 options)。我之前只传 2 个,
+// 第三个参数读到的是垃圾值, 可能让附加失败。
+typedef void (*ACEventAppendEventFn)(IOHIDEventRef, IOHIDEventRef, uint32_t);
 typedef void (*ACEventSetIntegerValueFn)(IOHIDEventRef, int32_t, int);
+typedef void (*ACEventSetFloatValueFn)(IOHIDEventRef, int32_t, IOHIDFloat);
 typedef void (*ACEventSetSenderIDFn)(IOHIDEventRef, uint64_t);
 typedef IOHIDEventSystemClientRef (*ACSystemClientCreateFn)(CFAllocatorRef);
 typedef IOHIDEventSystemClientRef (*ACSystemClientCreateWithTypeFn)(CFAllocatorRef, uint32_t, CFDictionaryRef);
@@ -158,9 +163,10 @@ typedef IOHIDEventSystemClientRef (*ACSystemClientCreateSimpleFn)(CFAllocatorRef
 typedef void (*ACSystemClientDispatchFn)(IOHIDEventSystemClientRef, IOHIDEventRef);
 
 static ACCreateDigitizerEventFn         pCreateDigitizerEvent = NULL;
-static ACCreateFingerEventWithQualityFn pCreateFingerEvent    = NULL;
+static ACCreateFingerEventFn            pCreateFingerEvent    = NULL;
 static ACEventAppendEventFn             pEventAppendEvent     = NULL;
 static ACEventSetIntegerValueFn         pEventSetIntegerValue = NULL;
+static ACEventSetFloatValueFn           pEventSetFloatValue   = NULL;
 static ACEventSetSenderIDFn             pEventSetSenderID     = NULL;
 static ACSystemClientCreateFn           pSystemClientCreate   = NULL;
 static ACSystemClientCreateWithTypeFn   pClientCreateWithType = NULL;
@@ -205,20 +211,22 @@ static void ACLoadIOHIDSymbols(void)
                 var = (__typeof__(var))h;                                       \
             } while (0)
         AC_BIND(pCreateDigitizerEvent, "IOHIDEventCreateDigitizerEvent");
-        AC_BIND(pCreateFingerEvent,    "IOHIDEventCreateDigitizerFingerEventWithQuality");
+        AC_BIND(pCreateFingerEvent,    "IOHIDEventCreateDigitizerFingerEvent");
         AC_BIND(pEventAppendEvent,     "IOHIDEventAppendEvent");
         AC_BIND(pEventSetIntegerValue, "IOHIDEventSetIntegerValue");
+        AC_BIND(pEventSetFloatValue,   "IOHIDEventSetFloatValue");
         AC_BIND(pEventSetSenderID,     "IOHIDEventSetSenderID");
         AC_BIND(pSystemClientCreate,   "IOHIDEventSystemClientCreate");
         AC_BIND(pClientCreateWithType, "IOHIDEventSystemClientCreateWithType");
         AC_BIND(pClientCreateSimple,   "IOHIDEventSystemClientCreateSimpleClient");
         AC_BIND(pSystemClientDispatch, "IOHIDEventSystemClientDispatchEvent");
         #undef AC_BIND
-        AC_LOG(@"IOKit 符号: digitizer=%@ finger=%@ append=%@ setInt=%@ setSender=%@",
+        AC_LOG(@"IOKit 符号: digitizer=%@ finger=%@ append=%@ setInt=%@ setFloat=%@ setSender=%@",
                pCreateDigitizerEvent ? @"有" : @"无",
                pCreateFingerEvent ? @"有" : @"无",
                pEventAppendEvent ? @"有" : @"无",
                pEventSetIntegerValue ? @"有" : @"无",
+               pEventSetFloatValue ? @"有" : @"无",
                pEventSetSenderID ? @"有" : @"无");
         AC_LOG(@"IOKit client: Create=%@ CreateWithType=%@ CreateSimple=%@ dispatch=%@",
                pSystemClientCreate ? @"有" : @"无",
@@ -228,7 +236,26 @@ static void ACLoadIOHIDSymbols(void)
     });
 }
 
-// 一个 "手 + 手指" 事件; x/y 用屏幕坐标(点)
+// 屏幕的 fixedCoordinateSpace 尺寸 (点)。手机始终以竖屏 home 为基准,
+// 所以 fixed space = 430x932, 与窗口坐标一致, 拿来当归一化的分母最合适。
+static CGSize ACScreenFixedSize(void)
+{
+    @try {
+        UIScreen *s = [UIScreen mainScreen];
+        if (s) {
+            CGSize sz = s.fixedCoordinateSpace.bounds.size;
+            if (sz.width > 0 && sz.height > 0) return sz;
+        }
+    } @catch (NSException *e) { }
+    return CGSizeMake(430, 932);
+}
+
+// 一个 "手 + 手指" 事件。按 ios-mcp 的**已验证可用**配方构造 (之前那版事件
+// 构造错了、坐标也错了, 是"派发毫无反应"的真正原因):
+//   1. 坐标**归一化到 0~1** (x/屏宽, y/屏高) —— 之前传点/像素彻底飞出屏幕;
+//   2. 手指用 13 参数的 IOHIDEventCreateDigitizerFingerEvent (不是 WithQuality);
+//   3. 手事件 index=99, identity=1, eventMask=0;
+//   4. 补上 digitizer 字段 0x4 / 0xb0007 / 0xb0008 / 0xb0009 / 0xb0014 / 0xb0015。
 static IOHIDEventRef ACCreateHIDEvent(CGPoint point, UITouchPhase phase, BOOL useSenderID)
 {
     if (!pCreateDigitizerEvent || !pCreateFingerEvent) return NULL;
@@ -240,32 +267,53 @@ static IOHIDEventRef ACCreateHIDEvent(CGPoint point, UITouchPhase phase, BOOL us
 
     IOHIDEventRef hand = pCreateDigitizerEvent(kCFAllocatorDefault, ts,
                                                kACTransducerTypeHand,
-                                               0, 0, kACDigitizerEventTouch, 0,
+                                               99, 1, 0, 0,
                                                0, 0, 0, 0, 0,
-                                               0, true, 0);
+                                               0, 0, 0);
     if (!hand) return NULL;
-    if (pEventSetIntegerValue) pEventSetIntegerValue(hand, kACFieldDigitizerIsDisplayIntegrated, 1);
+    if (pEventSetIntegerValue) {
+        pEventSetIntegerValue(hand, kACFieldDigitizerIsDisplayIntegrated, 1);   // 0xb0019
+        pEventSetIntegerValue(hand, 0x4, 1);
+    }
 
-    uint32_t mask = (phase == UITouchPhaseMoved)
-        ? kACDigitizerEventPosition
-        : (kACDigitizerEventRange | kACDigitizerEventTouch);
-    uint32_t touching = (phase == UITouchPhaseEnded) ? 0 : 1;
+    uint32_t mask = 0; BOOL range = YES, touch = YES;
+    switch (phase) {
+        case UITouchPhaseBegan:
+            mask = kACDigitizerEventRange | kACDigitizerEventTouch; range = YES; touch = YES; break;
+        case UITouchPhaseMoved:
+            mask = kACDigitizerEventPosition;                         range = YES; touch = YES; break;
+        case UITouchPhaseEnded:
+            mask = kACDigitizerEventTouch;                            range = NO;  touch = NO;  break;
+        default:
+            mask = kACDigitizerEventRange | kACDigitizerEventTouch;   range = YES; touch = YES; break;
+    }
+
+    CGSize sz = ACScreenFixedSize();
+    IOHIDFloat nx = (sz.width  > 0) ? (IOHIDFloat)(point.x / sz.width)  : 0.0;
+    IOHIDFloat ny = (sz.height > 0) ? (IOHIDFloat)(point.y / sz.height) : 0.0;
 
     IOHIDEventRef finger = pCreateFingerEvent(kCFAllocatorDefault, ts,
-                                              1, 2, mask,
-                                              (IOHIDFloat)point.x, (IOHIDFloat)point.y, 0.0,
-                                              0, 0,
-                                              5.0, 5.0, 1.0, 1.0, 1.0,
-                                              (Boolean)touching, (Boolean)touching, 0);
+                                              1, 3, mask,
+                                              nx, ny, 0.0,
+                                              0.0, 0.0,
+                                              range, touch, 0);
     if (!finger) { CFRelease(hand); return NULL; }
-    if (pEventSetIntegerValue) pEventSetIntegerValue(finger, kACFieldDigitizerIsDisplayIntegrated, 1);
+    if (pEventSetFloatValue) {
+        pEventSetFloatValue(finger, 0xb0014, 0.04);   // 接触半径
+        pEventSetFloatValue(finger, 0xb0015, 0.04);
+    }
 
+    if (pEventAppendEvent) pEventAppendEvent(hand, finger, 0);
+    CFRelease(finger);
+
+    if (pEventSetIntegerValue) {
+        pEventSetIntegerValue(hand, 0xb0007, 0x23);
+        pEventSetIntegerValue(hand, 0xb0008, 0x1);
+        pEventSetIntegerValue(hand, 0xb0009, 0x1);
+    }
     if (useSenderID && pEventSetSenderID) {
         pEventSetSenderID(hand, kACSyntheticSenderID);
-        pEventSetSenderID(finger, kACSyntheticSenderID);
     }
-    if (pEventAppendEvent) pEventAppendEvent(hand, finger);
-    CFRelease(finger);
     return hand;
 }
 
@@ -358,30 +406,30 @@ static IOHIDEventRef ACCreateHIDEvent(CGPoint point, UITouchPhase phase, BOOL us
     _dispatchCount++;
 
     @try {
-        IOHIDEventRef down = ACCreateHIDEvent(point, UITouchPhaseBegan, useSender);
-        IOHIDEventRef up   = ACCreateHIDEvent(point, UITouchPhaseEnded, useSender);
+        // 按下 -> 移动 -> 抬起, 各隔 50ms。
+        // 直接把按下/抬起背靠背派发, 会被系统在 UIKit 处理之前合并掉 (ios-mcp 的结论)。
+        IOHIDEventRef began = ACCreateHIDEvent(point, UITouchPhaseBegan, useSender);
+        if (began) { pSystemClientDispatch(_client, began); CFRelease(began); }
+        usleep(50 * 1000);
+
+        IOHIDEventRef moved = ACCreateHIDEvent(point, UITouchPhaseMoved, useSender);
+        if (moved) { pSystemClientDispatch(_client, moved); CFRelease(moved); }
+        usleep(50 * 1000);
+
+        IOHIDEventRef ended = ACCreateHIDEvent(point, UITouchPhaseEnded, useSender);
+        if (ended) { pSystemClientDispatch(_client, ended); CFRelease(ended); }
 
         if (_dispatchCount <= 4) {
-            // 头几次把细节全打出来, 方便判断"事件构造失败"还是"派发无效"
-            UIScreen *sc = [UIScreen mainScreen];
-            AC_LOG(@"派发 #%ld: 点=(%.0f, %.0f) 缩放=%.1f (像素=(%.0f, %.0f)) senderID=%@ down=%@ up=%@ client=%@",
-                   (long)_dispatchCount, point.x, point.y, sc.scale,
-                   point.x * sc.scale, point.y * sc.scale,
+            CGSize sz = ACScreenFixedSize();
+            AC_LOG(@"派发 #%ld: 点=(%.0f, %.0f) 归一化=(%.4f, %.4f) 屏=%.0fx%.0f senderID=%@ began/moved/ended=%@/%@/%@ client=%@",
+                   (long)_dispatchCount, point.x, point.y,
+                   sz.width > 0 ? point.x / sz.width : 0.0,
+                   sz.height > 0 ? point.y / sz.height : 0.0,
+                   sz.width, sz.height,
                    useSender ? @"带" : @"不带",
-                   down ? @"建好" : @"失败", up ? @"建好" : @"失败",
+                   began ? @"建好" : @"失败", moved ? @"建好" : @"失败", ended ? @"建好" : @"失败",
                    self.clientKind);
         }
-        if (!down || !up) {
-            if (_dispatchCount <= 4) AC_LOG(@"!! IOHID 事件构造失败, 无法派发");
-            if (down) CFRelease(down);
-            if (up) CFRelease(up);
-            return;
-        }
-
-        pSystemClientDispatch(_client, down);
-        pSystemClientDispatch(_client, up);
-        CFRelease(down);
-        CFRelease(up);
     } @catch (NSException *ex) {
         AC_LOG(@"派发异常: %@ - %@", ex.name, ex.reason);
     }
