@@ -31,6 +31,7 @@
 #import <UIKit/UIKit.h>
 #include <dlfcn.h>
 #include <mach/mach_time.h>
+#include <unistd.h>
 
 // ---------------------------------------------------------------------------
 // 日志
@@ -151,6 +152,30 @@ static IOHIDEventRef BBCreateEvent(CGPoint pt, BOOL ending)
     return hand;
 }
 
+// 滑动过程中的"移动"事件: eventMask 只用 Position(4), 不碰 Range/Touch
+static IOHIDEventRef BBCreateMoveEvent(CGPoint pt)
+{
+    if (!pDigitizer || !pFinger) return NULL;
+    uint64_t ab = mach_absolute_time();
+    BBAbsoluteTime ts; ts.lo = (uint32_t)ab; ts.hi = (uint32_t)(ab >> 32);
+
+    IOHIDEventRef hand = pDigitizer(kCFAllocatorDefault, ts, 3,
+                                    0, 0, 2, 0,
+                                    0, 0, 0, 0, 0, 0, true, 0);
+    if (!hand) return NULL;
+    if (pSetInt) pSetInt(hand, BB_FIELD_IS_DISPLAY_INTEGRATED, 1);
+
+    IOHIDEventRef finger = pFinger(kCFAllocatorDefault, ts, 1, 2, 4 /* Position */,
+                                   (IOHIDFloat)pt.x, (IOHIDFloat)pt.y, 0.0,
+                                   0, 0, 5.0, 5.0, 1.0, 1.0, 1.0,
+                                   (Boolean)1, (Boolean)1, 0);
+    if (!finger) { CFRelease(hand); return NULL; }
+    if (pSetInt) pSetInt(finger, BB_FIELD_IS_DISPLAY_INTEGRATED, 1);
+    if (pAppend) pAppend(hand, finger);
+    CFRelease(finger);
+    return hand;
+}
+
 // ---------------------------------------------------------------------------
 // 权限自检
 // ---------------------------------------------------------------------------
@@ -186,6 +211,52 @@ static void BBProbeEntitlements(void)
 }
 
 // ---------------------------------------------------------------------------
+// 派发动作
+// ---------------------------------------------------------------------------
+static IOHIDEventSystemClientRef BBMakeClient(int kind)
+{
+    if (kind == 1 && pCreateT) return pCreateT(kCFAllocatorDefault, 1, NULL);   // Admin
+    if (kind == 2 && pCreateT) return pCreateT(kCFAllocatorDefault, 5, NULL);   // System
+    if (pCreate)               return pCreate(kCFAllocatorDefault);             // Create
+    return NULL;
+}
+
+// 在同一个点连点 times 次
+static void BBTap(IOHIDEventSystemClientRef c, CGPoint p, int times)
+{
+    for (int i = 0; i < times; i++) {
+        IOHIDEventRef down = BBCreateEvent(p, NO);
+        IOHIDEventRef up   = BBCreateEvent(p, YES);
+        if (down) { pDispatch(c, down); CFRelease(down); }
+        if (up)   { pDispatch(c, up);   CFRelease(up); }
+        usleep(120 * 1000);            // 每次之间隔 120ms, 免得被当成连击
+    }
+}
+
+// 从 from 滑到 to, steps 个中间点。
+// ★ 这个动作用来选择"必然可见"的验证目标: 从屏幕顶部下滑 = 拉出通知中心,
+//   结果会一直留在屏幕上, 用户事后也能看到, 不像"点屏幕中心"那样毫无反应。
+static void BBSwipe(IOHIDEventSystemClientRef c, CGPoint from, CGPoint to, int steps)
+{
+    IOHIDEventRef down = BBCreateEvent(from, NO);
+    if (down) { pDispatch(c, down); CFRelease(down); }
+    usleep(30 * 1000);
+
+    for (int i = 1; i <= steps; i++) {
+        CGFloat t = (CGFloat)i / (CGFloat)steps;
+        CGPoint p = CGPointMake(from.x + (to.x - from.x) * t,
+                                from.y + (to.y - from.y) * t);
+        IOHIDEventRef mv = BBCreateMoveEvent(p);
+        if (mv) { pDispatch(c, mv); CFRelease(mv); }
+        usleep(16 * 1000);
+    }
+
+    usleep(30 * 1000);
+    IOHIDEventRef up = BBCreateEvent(to, YES);
+    if (up) { pDispatch(c, up); CFRelease(up); }
+}
+
+// ---------------------------------------------------------------------------
 // 入口
 // ---------------------------------------------------------------------------
 __attribute__((constructor))
@@ -202,30 +273,41 @@ static void BBProbeInit(void)
     BBLoadSymbols();
     BBProbeEntitlements();
 
-    // 15 秒后再点, 给用户留时间回到桌面方便观察
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        @autoreleasepool {
-            if (!pDispatch || (!pCreateT && !pCreate)) {
-                BBLog(@"派发测试: 符号不全, 放弃");
-                return;
+    if (!pDispatch) { BBLog(@"没有 dispatch 符号, 放弃"); return; }
+
+    // 四轮, 每轮换一种 client 类型, 且都用**必然可见**的动作:
+    //   第 1 轮: 点左下角 Dock 图标 -> 会打开一个 App
+    //   第 2~4 轮: 从屏幕顶部下滑 -> 会拉出通知中心 (结果会留在屏幕上)
+    //
+    // 为什么不用"点屏幕中心": 桌面中心本来就是空白, 点一下毫无反应 ——
+    // 上一版就是这么测的, 结论完全无效。这是那一轮的教训。
+    for (int round = 0; round < 4; round++) {
+        int kind = (round == 0) ? 2 : (round == 1 ? 2 : (round == 2 ? 0 : 1));
+        const char *kindName = (kind == 1) ? "Admin(1)" : (kind == 2 ? "System(5)" : "Create");
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((20 + round * 20) * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @autoreleasepool {
+                IOHIDEventSystemClientRef c = BBMakeClient(kind);
+                BBLog(@"---------- 第 %d 轮 (client=%s) ----------", round + 1, kindName);
+                BBLog(@"client = %@", c ? @"建好" : @"失败");
+                if (!c) return;
+
+                if (round == 0) {
+                    // 左下角 Dock 第一个图标 (430x932 屏, Dock 在屏幕底部)
+                    CGPoint p = CGPointMake(55, 850);
+                    BBLog(@"动作: 点 (%.0f, %.0f) 三次 —— 如果派发成功, 应该会打开一个 App", p.x, p.y);
+                    BBTap(c, p, 3);
+                    BBLog(@"已派发 3 次点击。★ 屏幕上有 App 被打开吗?");
+                } else {
+                    CGPoint from = CGPointMake(215, 3);      // 屏幕最顶部
+                    CGPoint to   = CGPointMake(215, 620);
+                    BBLog(@"动作: 从 (%.0f, %.0f) 下滑到 (%.0f, %.0f) —— 如果派发成功, 应该会拉出通知中心",
+                          from.x, from.y, to.x, to.y);
+                    BBSwipe(c, from, to, 30);
+                    BBLog(@"已派发滑动。★ 屏幕顶部有通知中心出现吗? (它会一直留着)");
+                }
             }
-            // 用 System(5) 类型 —— 在 backboardd 里这个应该最合适
-            IOHIDEventSystemClientRef client = pCreateT
-                ? pCreateT(kCFAllocatorDefault, 5, NULL)
-                : pCreate(kCFAllocatorDefault);
-            BBLog(@"派发测试: client = %@", client ? @"建好" : @"失败");
-            if (!client) return;
-
-            CGPoint pt = CGPointMake(215, 466);      // 屏幕中心 (430x932)
-            BBLog(@"派发测试: 在 (%.0f, %.0f) 派发一次点击 —— 请留意屏幕有没有反应", pt.x, pt.y);
-
-            IOHIDEventRef down = BBCreateEvent(pt, NO);
-            IOHIDEventRef up   = BBCreateEvent(pt, YES);
-            BBLog(@"派发测试: down=%@ up=%@", down ? @"建好" : @"失败", up ? @"建好" : @"失败");
-            if (down) { pDispatch(client, down); CFRelease(down); }
-            if (up)   { pDispatch(client, up);   CFRelease(up); }
-            BBLog(@"派发测试: 已经调用 dispatch 完毕 (如果屏幕没反应, 说明这条路也不通)");
-        }
-    });
+        });
+    }
 }
