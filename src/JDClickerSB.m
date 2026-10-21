@@ -53,7 +53,8 @@
 static NSString * const kJDTargetBundle = @"com.360buy.jdmobile";   // 京东
 static NSString * const kJDTargetName   = @"京东";
 
-static const CGFloat kACBallSize      = 56.0;
+// 62 而不是 56: 满屏撒花/弹幕的背景下小球容易被"吃掉", 稍微放大一点更好找。
+static const CGFloat kACBallSize      = 62.0;
 static const CGFloat kACMenuWidth     = 230.0;
 static const CGFloat kACMenuMargin    = 8.0;
 static const CGFloat kACCrosshairSize = 64.0;
@@ -791,8 +792,83 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
 
 @interface ACBallView : UIView
 @property (nonatomic, copy) void (^onTouchActive)(BOOL active);
+/// 连点运行中: 在球外面套一圈扩散的脉冲光环, 让它在满屏撒花/弹幕里也能一眼找到。
+- (void)setPulsing:(BOOL)pulsing;
 @end
+
 @implementation ACBallView
+{
+    CAShapeLayer *_pulse;
+    BOOL          _pulsing;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame
+{
+    if ((self = [super initWithFrame:frame])) {
+        // 脉冲光环: 一个椭圆描边层, 动画时整体放大 + 淡出。
+        // 放在球体的 layer 里而不是外面的容器, 因为 UIView 默认 masksToBounds=NO,
+        // 子层可以画到 bounds 之外, 所以光环能扩散到球外一圈。
+        _pulse = [CAShapeLayer layer];
+        _pulse.frame       = self.bounds;
+        _pulse.path        = [UIBezierPath bezierPathWithOvalInRect:CGRectInset(self.bounds, 1.5, 1.5)].CGPath;
+        _pulse.fillColor   = [UIColor clearColor].CGColor;
+        _pulse.strokeColor = [UIColor colorWithRed:1.0 green:0.86 blue:0.35 alpha:1.0].CGColor;
+        _pulse.lineWidth   = 3.0;
+        _pulse.opacity     = 0.0;
+        _pulse.hidden      = YES;
+        [self.layer addSublayer:_pulse];
+    }
+    return self;
+}
+
+- (void)layoutSubviews
+{
+    [super layoutSubviews];
+    _pulse.frame = self.bounds;
+    _pulse.path  = [UIBezierPath bezierPathWithOvalInRect:CGRectInset(self.bounds, 1.5, 1.5)].CGPath;
+}
+
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event
+{
+    // 视觉 62pt, 但只有中间 52pt 接手指。
+    // 理由: 球是 SpringBoard 的系统窗口, 命中优先级高于京东。如果准星标定的点击
+    // 坐标刚好落在球身上, 我们注入的那一下 HID 触摸会被自己的球接住、送不到京东,
+    // 等于白点一次。把热区收得比视觉小一圈, "看得见" 和 "不吞自己的点击" 就都有了。
+    return CGRectContainsPoint(CGRectInset(self.bounds, 5, 5), point);
+}
+
+- (void)setPulsing:(BOOL)pulsing
+{
+    if (pulsing == _pulsing) return;
+    _pulsing = pulsing;
+
+    if (!pulsing) {
+        [_pulse removeAnimationForKey:@"pulse"];
+        _pulse.hidden  = YES;
+        _pulse.opacity = 0.0;
+        return;
+    }
+
+    CABasicAnimation *scale = [CABasicAnimation animationWithKeyPath:@"transform.scale"];
+    scale.fromValue = @(1.0);
+    scale.toValue   = @(1.85);
+
+    CABasicAnimation *fade = [CABasicAnimation animationWithKeyPath:@"opacity"];
+    fade.fromValue = @(0.95);
+    fade.toValue   = @(0.0);
+
+    CAAnimationGroup *g = [CAAnimationGroup animation];
+    g.animations  = @[scale, fade];
+    g.duration    = 0.9;
+    g.repeatCount = HUGE_VALF;
+    // 显式给 beginTime, 否则重复加动画时会排队、光环越来越密
+    g.beginTime   = CACurrentMediaTime();
+
+    _pulse.hidden = NO;
+    _pulse.opacity = 0.95;
+    [_pulse addAnimation:g forKey:@"pulse"];
+}
+
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event
 { if (self.onTouchActive) self.onTouchActive(YES); [super touchesBegan:touches withEvent:event]; }
 - (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event
@@ -1008,20 +1084,28 @@ static UIWindowScene *ACAnyWindowScene(void)
 - (void)buildBall
 {
     _ball = [[ACBallView alloc] initWithFrame:CGRectMake(0, 0, kACBallSize, kACBallSize)];
-    _ball.backgroundColor = [UIColor colorWithWhite:0.20 alpha:0.92];
+    // ★ 不透明 + 白色粗描边 + 四周均匀黑影 ★
+    //   球本身就在 SpringBoard 的窗口里, 层级远高于京东的界面, 所以撒花/弹幕
+    //   在物理上盖不住它 —— 真正的问题是它太暗太素, 在花哨背景里"看不见"。
+    //   白描边负责在暗背景上立住, 黑影晕负责在亮背景上立住, 两边都不会糊。
+    _ball.backgroundColor = [UIColor colorWithWhite:0.16 alpha:1.0];
     _ball.layer.cornerRadius = kACBallSize * 0.5;
-    _ball.layer.borderWidth = 2.0;
-    _ball.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.75].CGColor;
+    _ball.layer.borderWidth = 3.0;
+    _ball.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:1.0].CGColor;
     _ball.layer.shadowColor = [UIColor blackColor].CGColor;
-    _ball.layer.shadowOpacity = 0.35;
-    _ball.layer.shadowRadius = 4.0;
-    _ball.layer.shadowOffset = CGSizeMake(0, 2);
+    _ball.layer.shadowOpacity = 0.85;
+    _ball.layer.shadowRadius = 7.0;
+    _ball.layer.shadowOffset = CGSizeZero;
+    // 给阴影一条固定的 path: 球要跟着手指拖、而且在 100/s 下一直有脉冲动画,
+    // 不指定 path 的话每帧都要重新算 alpha 遮罩, 白烧 CPU(费电)。
+    _ball.layer.shadowPath =
+        [UIBezierPath bezierPathWithRoundedRect:_ball.bounds cornerRadius:kACBallSize * 0.5].CGPath;
     _ball.userInteractionEnabled = YES;
 
     _ballLabel = [[UILabel alloc] initWithFrame:_ball.bounds];
     _ballLabel.textAlignment = NSTextAlignmentCenter;
     _ballLabel.textColor = [UIColor whiteColor];
-    _ballLabel.font = [UIFont boldSystemFontOfSize:15.0];
+    _ballLabel.font = [UIFont boldSystemFontOfSize:16.0];
     _ballLabel.text = @"连点";
     _ballLabel.userInteractionEnabled = NO;
     [_ball addSubview:_ballLabel];
@@ -1376,12 +1460,14 @@ static UIWindowScene *ACAnyWindowScene(void)
     BOOL running = eng.running;
 
     _ball.backgroundColor = running
-        ? [UIColor colorWithRed:0.88 green:0.16 blue:0.16 alpha:0.95]
-        : [UIColor colorWithWhite:0.20 alpha:0.92];
+        ? [UIColor colorWithRed:0.90 green:0.13 blue:0.11 alpha:1.0]
+        : [UIColor colorWithWhite:0.16 alpha:1.0];
     _ball.layer.borderColor = (running
-        ? [UIColor colorWithRed:1.0 green:0.55 blue:0.5 alpha:0.95]
-        : [UIColor colorWithWhite:1.0 alpha:0.75]).CGColor;
+        ? [UIColor colorWithRed:1.0 green:0.94 blue:0.60 alpha:1.0]
+        : [UIColor colorWithWhite:1.0 alpha:1.0]).CGColor;
     _ballLabel.text = running ? @"停" : @"连点";
+    // 运行中套一圈黄色脉冲光环 —— 满屏撒花时靠这圈扩散的光最容易定位
+    [_ball setPulsing:running];
 
     // 瞄准按钮始终是「瞄准」; 确认的动作现在由瞄准模式下底部的小按钮完成
     [_aimBtn setTitle:@"瞄准" forState:UIControlStateNormal];
