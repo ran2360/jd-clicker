@@ -304,7 +304,7 @@ static IOHIDEventRef ACCreateHIDEvent(CGPoint point, UITouchPhase phase, BOOL us
 @property (nonatomic, readonly) NSString *clientKind;
 + (instancetype)shared;
 - (void)prepare;
-- (void)tapAtPoint:(CGPoint)point;
+- (void)tapAtPoint:(CGPoint)point phaseDelay:(useconds_t)phaseDelayUs;
 @end
 
 @implementation ACTouchInjector
@@ -358,7 +358,7 @@ static IOHIDEventRef ACCreateHIDEvent(CGPoint point, UITouchPhase phase, BOOL us
             pCreateDigitizerEvent != NULL && pCreateFingerEvent != NULL);
 }
 
-- (void)tapAtPoint:(CGPoint)point
+- (void)tapAtPoint:(CGPoint)point phaseDelay:(useconds_t)phaseDelayUs
 {
     if (!self.ready) return;
 
@@ -368,29 +368,32 @@ static IOHIDEventRef ACCreateHIDEvent(CGPoint point, UITouchPhase phase, BOOL us
         // 一次点击 = 按下 -> 移动 -> 抬起。
         //
         // ★ 这里的间隔直接决定了**有效频率上限** ★
-        //   原来各隔 50ms, 一次点击就固定耗时 ~100ms, 于是 10/20/30/50 全都塌缩成
+        //   最初各隔 50ms, 一次点击固定耗时 ~100ms, 于是 10/20/30/50 全都塌缩成
         //   ~10 次/秒 —— 这就是"设什么频率都一样"的根本原因(不是 iOS 的硬性上限)。
-        //   改成 6ms: 一次点击约 15ms, 上限 ~66 次/秒, 四档(10/20/30/50)全都能跑到。
+        //   现在由调用方按频率算好传进来: 10~50/s 用 6ms, 100/s 自动压到 ~2.5ms,
+        //   这样 10/20/30/50/100 五档才都能真正跑到。
         //   仍然保留很短的间隔(不是 0), 是为了让 down/move/up 成为三个可区分的事件,
         //   否则会被系统合并掉 —— 这一点是实测得出的, 不能去掉。
+        const useconds_t d = phaseDelayUs ?: (6 * 1000);
+
         IOHIDEventRef began = ACCreateHIDEvent(point, UITouchPhaseBegan, YES);
         if (began) { pSystemClientDispatch(_client, began); CFRelease(began); }
-        usleep(6 * 1000);
+        usleep(d);
 
         IOHIDEventRef moved = ACCreateHIDEvent(point, UITouchPhaseMoved, YES);
         if (moved) { pSystemClientDispatch(_client, moved); CFRelease(moved); }
-        usleep(6 * 1000);
+        usleep(d);
 
         IOHIDEventRef ended = ACCreateHIDEvent(point, UITouchPhaseEnded, YES);
         if (ended) { pSystemClientDispatch(_client, ended); CFRelease(ended); }
 
         if (_dispatchCount <= 4) {
             CGSize sz = ACScreenFixedSize();
-            AC_LOG(@"派发 #%ld: 点=(%.0f, %.0f) 归一化=(%.4f, %.4f) 屏=%.0fx%.0f began/moved/ended=%@/%@/%@ client=%@",
+            AC_LOG(@"派发 #%ld: 点=(%.0f, %.0f) 归一化=(%.4f, %.4f) 屏=%.0fx%.0f 相位间隔=%ldus began/moved/ended=%@/%@/%@ client=%@",
                    (long)_dispatchCount, point.x, point.y,
                    sz.width > 0 ? point.x / sz.width : 0.0,
                    sz.height > 0 ? point.y / sz.height : 0.0,
-                   sz.width, sz.height,
+                   sz.width, sz.height, (long)d,
                    began ? @"建好" : @"失败", moved ? @"建好" : @"失败", ended ? @"建好" : @"失败",
                    self.clientKind);
         }
@@ -723,6 +726,15 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
     const double  f = MAX(1.0, _frequency);
     const double  interval = 1.0 / f;
 
+    // 按下/移动/抬起之间的间隔, 必须小于「点击间隔」才跑得满设定频率:
+    //   10/20/30/50 次每秒 -> 间隔 100/50/33/20ms, 6ms×2 完全够;
+    //   100 次每秒        -> 间隔只有 10ms, 6ms×2 会超时, 必须压到 ~2.5ms。
+    double phaseDelay = 0.006;
+    if (interval < 0.015) {
+        phaseDelay = MAX(0.0015, interval * 0.25);
+    }
+    const useconds_t phaseDelayUs = (useconds_t)(phaseDelay * 1e6);
+
     _slot  = dispatch_semaphore_create(1);
     _queue = dispatch_queue_create("com.jdclicker.sb", DISPATCH_QUEUE_SERIAL);
     _timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _queue);
@@ -736,12 +748,12 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
         if (!sself || !sself->_timer) return;
         if (dispatch_semaphore_wait(slot, DISPATCH_TIME_NOW) != 0) return;
         // HID 派发不要求主线程, 直接在当前队列做
-        [[ACTouchInjector shared] tapAtPoint:p];
+        [[ACTouchInjector shared] tapAtPoint:p phaseDelay:phaseDelayUs];
         dispatch_semaphore_signal(slot);
     });
     dispatch_resume(_timer);
 
-    AC_LOG(@"开始连点: 位置=(%.0f, %.0f) 频率=%.0f/s", p.x, p.y, f);
+    AC_LOG(@"开始连点: 位置=(%.0f, %.0f) 频率=%.0f/s 相位间隔=%ldus", p.x, p.y, f, (long)phaseDelayUs);
     if (self.onStateChange) self.onStateChange(YES);
     return YES;
 }
@@ -1057,12 +1069,16 @@ static UIWindowScene *ACAnyWindowScene(void)
     _startBtn.frame = CGRectMake(10, 56, w - 20, 40);
     [_menu addSubview:_startBtn];
 
-    _freqCtrl = [[UISegmentedControl alloc] initWithItems:@[@"10/s", @"20/s", @"30/s", @"50/s"]];
+    _freqCtrl = [[UISegmentedControl alloc] initWithItems:@[@"10/s", @"20/s", @"30/s", @"50/s", @"100/s"]];
     _freqCtrl.frame = CGRectMake(10, 102, w - 20, 32);
     _freqCtrl.selectedSegmentIndex = _freqIndex;
     // ★ 深色面板上必须显式把分段控件的文字设成白色 ★
     //   默认是系统黑色文字, 压在 0.12 的深灰面板上几乎看不见。
-    NSDictionary *segTextAttrs = @{ NSForegroundColorAttributeName: [UIColor whiteColor] };
+    //   5 段挤在 210pt 里, 字号收到 11.5 才不至于把 "100/s" 挤变形。
+    NSDictionary *segTextAttrs = @{
+        NSForegroundColorAttributeName: [UIColor whiteColor],
+        NSFontAttributeName: [UIFont systemFontOfSize:11.5],
+    };
     [_freqCtrl setTitleTextAttributes:segTextAttrs forState:UIControlStateNormal];
     [_freqCtrl setTitleTextAttributes:segTextAttrs forState:UIControlStateSelected];
     _freqCtrl.backgroundColor = [UIColor colorWithWhite:0.26 alpha:1.0];   // 给白字一个可读的底
@@ -1117,7 +1133,7 @@ static UIWindowScene *ACAnyWindowScene(void)
 
 #pragma mark 持久化
 
-- (NSArray<NSNumber *> *)freqPresets { return @[@10.0, @20.0, @30.0, @50.0]; }
+- (NSArray<NSNumber *> *)freqPresets { return @[@10.0, @20.0, @30.0, @50.0, @100.0]; }
 
 - (double)currentFrequency
 {
