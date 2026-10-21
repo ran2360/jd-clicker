@@ -70,6 +70,7 @@ static NSString * const kACKeyFreq    = @"jd_freq";
 static NSString * const kACKeyBallX   = @"jd_ball_x";
 static NSString * const kACKeyBallY   = @"jd_ball_y";
 static NSString * const kACKeyAimed   = @"jd_aimed";
+static NSString * const kACKeyAutoStop = @"jd_autostop";   // 自动停止秒数, 0 = 一直不停
 
 // ===========================================================================
 // MARK: - 日志 (写文件, Filza 直接可看)
@@ -931,12 +932,20 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
     UILabel             *_statusLabel;
     ACCrosshairView     *_crosshair;
 
+    UIButton            *_autoStopBtn;     // 菜单里的「自动停止」入口
+    UIView              *_autoPanel;       // 秒数选择面板
+    UITextField         *_autoField;
+
     BOOL                 _aiming;
     CGPoint              _point;
     BOOL                 _hasPoint;
     NSInteger            _freqIndex;
     BOOL                 _targetFront;
     NSInteger            _installRetry;
+
+    NSInteger            _autoStopSec;     // 0 = 一直不停
+    NSInteger            _autoStopGen;     // 每次(重新)计时都 +1, 旧的回调据此作废
+    NSTimeInterval       _autoStopDeadline;// CACurrentMediaTime 基准的到点时刻
 }
 
 + (instancetype)shared
@@ -1022,6 +1031,7 @@ static UIWindowScene *ACAnyWindowScene(void)
     _window = win;
     [self buildBall];
     [self buildMenu];
+    [self buildAutoPanel];
     [self buildConfirmButton];
     [self buildCrosshair];
     [self refreshUI];
@@ -1074,6 +1084,12 @@ static UIWindowScene *ACAnyWindowScene(void)
         _window.hidden = wantHidden;
         if (!wantHidden) AC_LOG(@"悬浮球已显示");
         else AC_LOG(@"悬浮球已隐藏");
+    }
+
+    // 有倒计时在跑时, 顺带刷新一下剩余秒数(2Hz, 几乎不耗电)
+    if (!_window.hidden && _autoStopSec > 0 && _autoStopDeadline > 0 &&
+        [ACClickEngine shared].running) {
+        [self refreshUI];
     }
 
     [self scheduleNextVisTick];
@@ -1135,8 +1151,8 @@ static UIWindowScene *ACAnyWindowScene(void)
 - (void)buildMenu
 {
     CGFloat w = kACMenuWidth;
-    // 去掉「派发方式」那一行后, 高度相应减掉 38
-    CGFloat h = 10 + 40 + 6 + 40 + 6 + 32 + 6 + 78 + 10;   // 228
+    // 行序: 瞄准 / 开始 / 频率 / 自动停止 / 状态, 行间 6pt, 上下各 10pt
+    CGFloat h = 10 + 40 + 6 + 40 + 6 + 32 + 6 + 32 + 6 + 78 + 10;   // 266
 
     _menu = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, h)];
     _menu.backgroundColor = [UIColor colorWithWhite:0.12 alpha:0.94];
@@ -1172,13 +1188,95 @@ static UIWindowScene *ACAnyWindowScene(void)
     [_freqCtrl addTarget:self action:@selector(onFreqChanged:) forControlEvents:UIControlEventValueChanged];
     [_menu addSubview:_freqCtrl];
 
-    _statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 140, w - 24, 78)];
+    _autoStopBtn = [self makeButtonWithTitle:@"自动停止: 不限" action:@selector(onAutoStopTapped:)];
+    _autoStopBtn.frame = CGRectMake(10, 140, w - 20, 32);
+    _autoStopBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14.0];
+    _autoStopBtn.backgroundColor = [UIColor colorWithWhite:0.28 alpha:1.0];
+    [_menu addSubview:_autoStopBtn];
+
+    _statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 178, w - 24, 78)];
     _statusLabel.numberOfLines = 6;
     _statusLabel.font = [UIFont systemFontOfSize:9.5];
     _statusLabel.textColor = [UIColor colorWithWhite:0.85 alpha:1.0];
     [_menu addSubview:_statusLabel];
 
     [_window addSubview:_menu];
+}
+
+// ---- 自动停止秒数面板 ----
+// 为什么不用「UIAlertController + 文本框」而要自己搭一个面板:
+//   文本框要弹系统键盘, 而系统键盘要求所在窗口是 key window; 我们的悬浮窗不是
+//   SpringBoard 的主窗口, 去抢 key 会连带影响系统 UI, 不稳妥。
+//   所以这里以**预设按钮**为主路径 —— 完全不需要键盘; 文本框只是补充,
+//   键盘弹得出来就随便输入, 弹不出来也照样能设。
+- (void)buildAutoPanel
+{
+    CGFloat pw = 250.0, ph = 162.0;
+    _autoPanel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, pw, ph)];
+    _autoPanel.backgroundColor = [UIColor colorWithWhite:0.10 alpha:0.97];
+    _autoPanel.layer.cornerRadius = 12.0;
+    _autoPanel.layer.borderWidth = 1.0;
+    _autoPanel.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.22].CGColor;
+    _autoPanel.hidden = YES;
+
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(12, 9, pw - 24, 17)];
+    title.text = @"自动停止";
+    title.font = [UIFont boldSystemFontOfSize:13.0];
+    title.textColor = [UIColor whiteColor];
+    [_autoPanel addSubview:title];
+
+    UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(12, 27, pw - 24, 13)];
+    hint.text = @"到点自动停; 「不限」= 一直点击";
+    hint.font = [UIFont systemFontOfSize:9.5];
+    hint.textColor = [UIColor colorWithWhite:0.70 alpha:1.0];
+    [_autoPanel addSubview:hint];
+
+    // 预设: 两行三列, 点一下立即生效并关闭面板(不依赖键盘)
+    NSArray *titles1 = @[@"10 秒", @"30 秒", @"60 秒"];
+    NSArray *titles2 = @[@"2 分钟", @"5 分钟", @"不限"];
+    NSArray *vals1   = @[@10, @30, @60];
+    NSArray *vals2   = @[@120, @300, @0];
+    CGFloat bw = (pw - 24 - 12) / 3.0;              // 三等分, 两个 6pt 间隔
+    for (NSInteger r = 0; r < 2; r++) {
+        NSArray *ts = (r == 0) ? titles1 : titles2;
+        NSArray *vs = (r == 0) ? vals1   : vals2;
+        for (NSInteger c = 0; c < 3; c++) {
+            UIButton *b = [self makeButtonWithTitle:ts[c] action:@selector(onAutoPresetTapped:)];
+            b.tag = [vs[c] integerValue];
+            b.titleLabel.font = [UIFont boldSystemFontOfSize:13.0];
+            b.backgroundColor = [UIColor colorWithWhite:0.30 alpha:1.0];
+            b.frame = CGRectMake(12 + c * (bw + 6), 46 + r * 36, bw, 32);
+            [_autoPanel addSubview:b];
+        }
+    }
+
+    _autoField = [[UITextField alloc] initWithFrame:CGRectMake(12, 120, pw - 24 - 74, 32)];
+    _autoField.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1.0];
+    _autoField.textColor = [UIColor whiteColor];
+    _autoField.tintColor = [UIColor whiteColor];
+    _autoField.font = [UIFont systemFontOfSize:14.0];
+    _autoField.keyboardType = UIKeyboardTypeNumberPad;
+    _autoField.textAlignment = NSTextAlignmentCenter;
+    _autoField.placeholder = @"自定义秒数";
+    _autoField.layer.cornerRadius = 7.0;
+    _autoField.text = @"";
+    [_autoPanel addSubview:_autoField];
+
+    UIButton *ok = [self makeButtonWithTitle:@"确定" action:@selector(onAutoConfirmTapped:)];
+    ok.titleLabel.font = [UIFont boldSystemFontOfSize:14.0];
+    ok.backgroundColor = [UIColor colorWithRed:0.16 green:0.46 blue:0.30 alpha:1.0];
+    ok.frame = CGRectMake(pw - 12 - 68, 120, 68, 32);
+    [_autoPanel addSubview:ok];
+
+    [_window addSubview:_autoPanel];
+}
+
+- (NSString *)autoStopTitleText
+{
+    if (_autoStopSec <= 0) return @"自动停止: 不限";
+    if (_autoStopSec >= 60 && _autoStopSec % 60 == 0)
+        return [NSString stringWithFormat:@"自动停止: %ld 分钟", (long)(_autoStopSec / 60)];
+    return [NSString stringWithFormat:@"自动停止: %ld 秒", (long)_autoStopSec];
 }
 
 // 瞄准时用的「确认」小按钮: 面板收起后, 这是唯一还能点确认的地方。
@@ -1248,6 +1346,9 @@ static UIWindowScene *ACAnyWindowScene(void)
     for (NSInteger i = 0; i < (NSInteger)presets.count; i++) {
         if (fabs(presets[i].doubleValue - f) < 0.01) { _freqIndex = i; break; }
     }
+
+    _autoStopSec = [d integerForKey:kACKeyAutoStop];   // 0 = 一直不停(默认)
+    if (_autoStopSec < 0) _autoStopSec = 0;
 }
 
 - (void)savePoint
@@ -1330,6 +1431,12 @@ static UIWindowScene *ACAnyWindowScene(void)
 
 - (void)onBallTap:(UITapGestureRecognizer *)g
 {
+    // 秒数面板开着时, 点球 = 收起面板(不改动设定)
+    if (!_autoPanel.hidden) {
+        AC_LOG(@"关闭自动停止面板(未改动)");
+        [self closeAutoPanel];
+        return;
+    }
     if (_aiming) {
         // 瞄准中再点球 = 取消瞄准
         _aiming = NO;
@@ -1360,6 +1467,7 @@ static UIWindowScene *ACAnyWindowScene(void)
 {
     if ([ACClickEngine shared].running) { AC_LOG(@"请先停止连点再瞄准"); [self refreshUI]; return; }
     if (_aiming) return;
+    if (!_autoPanel.hidden) [self closeAutoPanel];
 
     _aiming = YES;
     _crosshair.hidden = NO;
@@ -1390,6 +1498,7 @@ static UIWindowScene *ACAnyWindowScene(void)
     ACClickEngine *eng = [ACClickEngine shared];
 
     if (eng.running) {
+        [self disarmAutoStop];
         [eng stop];
         _menu.hidden = YES;              // 停止后也把面板收起来, 保持屏幕干净
         [self refreshUI];
@@ -1425,6 +1534,7 @@ static UIWindowScene *ACAnyWindowScene(void)
     eng.point = _point;
     eng.frequency = [self currentFrequency];
     [eng start];
+    [self armAutoStop];                  // 若设了秒数, 到点自动停
     _menu.hidden = YES;                  // ★ 开始后收起面板, 不挡连点区域
     [self refreshUI];
 }
@@ -1435,8 +1545,95 @@ static UIWindowScene *ACAnyWindowScene(void)
     [self saveFrequency];
     ACClickEngine *eng = [ACClickEngine shared];
     eng.frequency = [self currentFrequency];
-    if (eng.running) { [eng stop]; [eng start]; }
+    if (eng.running) { [eng stop]; [eng start]; [self armAutoStop]; }   // 换频率=重新开始, 计时也重来
     [self refreshUI];
+}
+
+#pragma mark 自动停止
+
+- (void)onAutoStopTapped:(UIButton *)b
+{
+    if ([ACClickEngine shared].running) {
+        AC_LOG(@"请先停止连点再改「自动停止」");
+        [self refreshUI];
+        return;
+    }
+    _autoField.text = (_autoStopSec > 0) ? [NSString stringWithFormat:@"%ld", (long)_autoStopSec] : @"";
+    _autoPanel.hidden = NO;
+    [self positionAutoPanel];
+    _menu.hidden = YES;                  // 面板代替菜单, 避免两块叠在一起
+    AC_LOG(@"打开自动停止面板 (当前: %@)", [self autoStopTitleText]);
+}
+
+- (void)positionAutoPanel
+{
+    CGSize s = _window.bounds.size;
+    CGSize ps = _autoPanel.bounds.size;
+    _autoPanel.center = CGPointMake(s.width * 0.5, s.height - ps.height * 0.5 - 90);
+}
+
+- (void)closeAutoPanel
+{
+    if (_autoPanel.hidden) return;
+    [_autoField resignFirstResponder];
+    _autoPanel.hidden = YES;
+    _menu.hidden = NO;
+    [self positionMenu];
+    [self refreshUI];
+}
+
+- (void)onAutoPresetTapped:(UIButton *)b
+{
+    [self applyAutoStopSec:b.tag];
+}
+
+- (void)onAutoConfirmTapped:(UIButton *)b
+{
+    NSInteger sec = _autoField.text.integerValue;
+    if (sec < 0) sec = 0;
+    if (sec > 6 * 3600) sec = 6 * 3600;   // 上限 6 小时, 防止手滑输入天文数字
+    [self applyAutoStopSec:sec];
+}
+
+- (void)applyAutoStopSec:(NSInteger)sec
+{
+    _autoStopSec = sec;
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    [d setInteger:sec forKey:kACKeyAutoStop];
+    [d synchronize];
+    AC_LOG(@"自动停止已设为: %@ (%ld 秒)", (sec > 0 ? [self autoStopTitleText] : @"不限(一直点)"), (long)sec);
+    [self closeAutoPanel];
+}
+
+// 开始连点时挂上倒计时; 每次挂都让 _autoStopGen 自增, 之前排的回调自动失效。
+- (void)armAutoStop
+{
+    _autoStopGen++;
+    _autoStopDeadline = 0;
+    if (_autoStopSec <= 0) return;        // 不限时: 什么都不排
+
+    const NSInteger sec = _autoStopSec;
+    const NSInteger gen = _autoStopGen;
+    _autoStopDeadline = CACurrentMediaTime() + (NSTimeInterval)sec;
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)sec * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{
+        ACOverlay *sself = weakSelf;
+        if (!sself || sself->_autoStopGen != gen) return;   // 已被手动停止/重新开始
+        ACClickEngine *eng = [ACClickEngine shared];
+        if (!eng.running) return;
+        AC_LOG(@"定时自动停止: 已到 %ld 秒, 停止连点", (long)sec);
+        [eng stop];
+        sself->_autoStopDeadline = 0;
+        [sself refreshUI];
+    });
+}
+
+- (void)disarmAutoStop
+{
+    _autoStopGen++;
+    _autoStopDeadline = 0;
 }
 
 #pragma mark 布局 / 刷新
@@ -1482,12 +1679,24 @@ static UIWindowScene *ACAnyWindowScene(void)
 
     _freqCtrl.selectedSegmentIndex = _freqIndex;
 
+    [_autoStopBtn setTitle:[self autoStopTitleText] forState:UIControlStateNormal];
+    _autoStopBtn.backgroundColor = (_autoStopSec > 0)
+        ? [UIColor colorWithRed:0.30 green:0.34 blue:0.62 alpha:1.0]
+        : [UIColor colorWithWhite:0.28 alpha:1.0];
+
+    NSString *stateText = running ? @"连点中" : (_aiming ? @"瞄准中" : @"待机");
+    if (running && _autoStopSec > 0 && _autoStopDeadline > 0) {
+        NSInteger remain = (NSInteger)ceil(_autoStopDeadline - CACurrentMediaTime());
+        remain = MAX(0, remain);
+        stateText = [NSString stringWithFormat:@"连点中 (剩 %lds)", (long)remain];
+    }
+
     _statusLabel.text = [NSString stringWithFormat:
         @"坐标 %.0f, %.0f %@ | 频率 %.0f/s\n状态: %@\n%@: %@\n派发: %@\nHID: %@",
         _point.x, _point.y,
         _hasPoint ? @"" : @"(未保存)",
         [self currentFrequency],
-        running ? @"连点中" : (_aiming ? @"瞄准中" : @"待机"),
+        stateText,
         kJDTargetName, _targetFront ? @"前台" : @"不在前台",
         inj.clientKind,
         inj.diagnostics ?: @"?"];
