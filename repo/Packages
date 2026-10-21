@@ -1,29 +1,29 @@
 Package: com.autoclicker.jdclicker
-Version: 1.0.2036
+Version: 1.0.2037
 Architecture: iphoneos-arm64
 Maintainer: local build
-Installed-Size: 236
-Filename: ./com.autoclicker.jdclicker_1.0.2036_iphoneos-arm64.deb
-Size: 28668
-MD5sum: d483529e2bc602ac9a99c4a57a04a001
-SHA1: b27df67a6ac18e711b6f38895c877acfd45de85a
-SHA256: 2286f97449ef83d9c881a5d96df313f00477a44d0043997dae6fd89d336d698e
+Installed-Size: 252
+Filename: ./com.autoclicker.jdclicker_1.0.2037_iphoneos-arm64.deb
+Size: 32360
+MD5sum: 216d570cfa1be1fcc32f742fb39ad87b
+SHA1: fcbd39ec4dc05325ed964df8391f218997eaf7df
+SHA256: eb7f91dc6a320cac919a8a75910da91fb09ace79a9ea8fa8e9857aa7ecb4a7d2
 Section: Tweaks
 Name: JDClickerSB
 Author: local build
-Description: 京东连点器 (SpringBoard 侧) —— 悬浮球/准星瞄准/10-100 次每秒; 用系统级 HID 注入触摸, 只在京东前台时显示
+Description: 京东连点器 (SpringBoard 侧) —— 悬浮球/准星瞄准/10-100 次每秒/可设秒数定时自动停止; 用系统级 HID 注入触摸, 只在京东前台时显示
 
 Package: com.autoclicker.jdclicker
-Version: 1.0.2036
+Version: 1.0.2037
 Architecture: iphoneos-arm64e
 Maintainer: local build
-Installed-Size: 236
-Filename: ./com.autoclicker.jdclicker_1.0.2036_iphoneos-arm64e.deb
-Size: 28634
-MD5sum: 203e043208af4b79f9025e42b24bbe3a
-SHA1: f780c468f380cb7a1543b8d306148a8340703367
-SHA256: 5332749297e5adc79329bb344b8eec61d305bd5f5e8b4daf223b0f1276b59152
+Installed-Size: 252
+Filename: ./com.autoclicker.jdclicker_1.0.2037_iphoneos-arm64e.deb
+Size: 32342
+MD5sum: a82ffb7548f6beb0d2a3ad0e69b68e86
+SHA1: 15f0f159c93f1ba2ddc4729328995a70192486fc
+SHA256: 749c9de5b217771fad7821409795ee196f1bb105808f52aa760af0904b7369cb
 Section: Tweaks
 Name: JDClickerSB
 Author: local build
-Description: 京东连点器 (SpringBoard 侧) —— 悬浮球/准星瞄准/10-100 次每秒; 用系统级 HID 注入触摸, 只在京东前台时显示
+Description: 京东连点器 (SpringBoard 侧) —— 悬浮球/准星瞄准/10-100 次每秒/可设秒数定时自动停止; 用系统级 HID 注入触摸, 只在京东前台时显示
