@@ -365,15 +365,21 @@ static IOHIDEventRef ACCreateHIDEvent(CGPoint point, UITouchPhase phase, BOOL us
     _dispatchCount++;
 
     @try {
-        // 按下 -> 移动 -> 抬起, 各隔 50ms。
-        // 直接把按下/抬起背靠背派发, 会被系统在 UIKit 处理之前合并掉 (ios-mcp 的结论)。
+        // 一次点击 = 按下 -> 移动 -> 抬起。
+        //
+        // ★ 这里的间隔直接决定了**有效频率上限** ★
+        //   原来各隔 50ms, 一次点击就固定耗时 ~100ms, 于是 10/20/30/50 全都塌缩成
+        //   ~10 次/秒 —— 这就是"设什么频率都一样"的根本原因(不是 iOS 的硬性上限)。
+        //   改成 6ms: 一次点击约 15ms, 上限 ~66 次/秒, 四档(10/20/30/50)全都能跑到。
+        //   仍然保留很短的间隔(不是 0), 是为了让 down/move/up 成为三个可区分的事件,
+        //   否则会被系统合并掉 —— 这一点是实测得出的, 不能去掉。
         IOHIDEventRef began = ACCreateHIDEvent(point, UITouchPhaseBegan, YES);
         if (began) { pSystemClientDispatch(_client, began); CFRelease(began); }
-        usleep(50 * 1000);
+        usleep(6 * 1000);
 
         IOHIDEventRef moved = ACCreateHIDEvent(point, UITouchPhaseMoved, YES);
         if (moved) { pSystemClientDispatch(_client, moved); CFRelease(moved); }
-        usleep(50 * 1000);
+        usleep(6 * 1000);
 
         IOHIDEventRef ended = ACCreateHIDEvent(point, UITouchPhaseEnded, YES);
         if (ended) { pSystemClientDispatch(_client, ended); CFRelease(ended); }
@@ -1054,6 +1060,12 @@ static UIWindowScene *ACAnyWindowScene(void)
     _freqCtrl = [[UISegmentedControl alloc] initWithItems:@[@"10/s", @"20/s", @"30/s", @"50/s"]];
     _freqCtrl.frame = CGRectMake(10, 102, w - 20, 32);
     _freqCtrl.selectedSegmentIndex = _freqIndex;
+    // ★ 深色面板上必须显式把分段控件的文字设成白色 ★
+    //   默认是系统黑色文字, 压在 0.12 的深灰面板上几乎看不见。
+    NSDictionary *segTextAttrs = @{ NSForegroundColorAttributeName: [UIColor whiteColor] };
+    [_freqCtrl setTitleTextAttributes:segTextAttrs forState:UIControlStateNormal];
+    [_freqCtrl setTitleTextAttributes:segTextAttrs forState:UIControlStateSelected];
+    _freqCtrl.backgroundColor = [UIColor colorWithWhite:0.26 alpha:1.0];   // 给白字一个可读的底
     if (@available(iOS 13.0, *)) {
         _freqCtrl.selectedSegmentTintColor = [UIColor colorWithRed:0.20 green:0.52 blue:0.96 alpha:1.0];
     }
