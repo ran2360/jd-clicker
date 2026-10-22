@@ -929,7 +929,7 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
     UIView              *_menu;
     UIButton            *_aimBtn;
     UIButton            *_startBtn;
-    UILabel             *_freqLabel;       // 频率已固定 10/s, 这里只做只读显示
+    UISegmentedControl  *_freqCtrl;        // 只有 10/s 和 20/s 两档
     UIButton            *_confirmBtn;      // 瞄准时替代菜单的「确认」小按钮
     UILabel             *_statusLabel;
     ACCrosshairView     *_crosshair;
@@ -940,6 +940,7 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
     BOOL                 _aiming;
     CGPoint              _point;
     BOOL                 _hasPoint;
+    NSInteger            _freqIndex;       // 0 = 10/s, 1 = 20/s
     BOOL                 _targetFront;
     NSInteger            _installRetry;
 
@@ -1169,19 +1170,25 @@ static UIWindowScene *ACAnyWindowScene(void)
     _startBtn.frame = CGRectMake(10, 56, w - 20, 40);
     [_menu addSubview:_startBtn];
 
-    // ★ 频率固定 10 次/秒, 不再给选项 ★
-    //   实测 20/s 及以上在不少页面里反而"点不动" (页面自己的防抖/滚动判定会把
-    //   过密的连点吞掉), 留着只能误导。这里改成一行只读说明, 高度沿用原来的 32pt,
-    //   省得整块面板的尺寸/坐标全要重排。
-    _freqLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 102, w - 20, 32)];
-    _freqLabel.text = @"频率: 10 次/秒 (固定)";
-    _freqLabel.textAlignment = NSTextAlignmentCenter;
-    _freqLabel.font = [UIFont boldSystemFontOfSize:13.0];
-    _freqLabel.textColor = [UIColor whiteColor];
-    _freqLabel.backgroundColor = [UIColor colorWithWhite:0.26 alpha:1.0];
-    _freqLabel.layer.cornerRadius = 7.0;
-    _freqLabel.clipsToBounds = YES;
-    [_menu addSubview:_freqLabel];
+    // ★ 频率只留 10/s 和 20/s 两档 ★
+    //   20/s 在一些页面里会被页面自己的防抖/滚动判定吞掉, 但多数场景更快更顺手,
+    //   所以两档都留着让用户按场景切; 30/50/100 已移除 (基本点不动, 只有反作用)。
+    _freqCtrl = [[UISegmentedControl alloc] initWithItems:@[@"10/s", @"20/s"]];
+    _freqCtrl.frame = CGRectMake(10, 102, w - 20, 32);
+    _freqCtrl.selectedSegmentIndex = _freqIndex;
+    // 深色面板上必须显式把分段控件的文字设成白色, 默认黑字基本看不见。
+    NSDictionary *segTextAttrs = @{
+        NSForegroundColorAttributeName: [UIColor whiteColor],
+        NSFontAttributeName: [UIFont boldSystemFontOfSize:13.0],
+    };
+    [_freqCtrl setTitleTextAttributes:segTextAttrs forState:UIControlStateNormal];
+    [_freqCtrl setTitleTextAttributes:segTextAttrs forState:UIControlStateSelected];
+    _freqCtrl.backgroundColor = [UIColor colorWithWhite:0.26 alpha:1.0];   // 给白字一个可读的底
+    if (@available(iOS 13.0, *)) {
+        _freqCtrl.selectedSegmentTintColor = [UIColor colorWithRed:0.20 green:0.52 blue:0.96 alpha:1.0];
+    }
+    [_freqCtrl addTarget:self action:@selector(onFreqChanged:) forControlEvents:UIControlEventValueChanged];
+    [_menu addSubview:_freqCtrl];
 
     _autoStopBtn = [self makeButtonWithTitle:@"自动停止: 不限" action:@selector(onAutoStopTapped:)];
     _autoStopBtn.frame = CGRectMake(10, 140, w - 20, 32);
@@ -1291,9 +1298,15 @@ static UIWindowScene *ACAnyWindowScene(void)
 
 #pragma mark 持久化
 
-// 频率固定 10 次每秒: 20/s 及以上在部分页面里反而点不动, 所以只留这一个值,
-// 也不再读写 NSUserDefaults 里的旧档位 (老用户存着 50/100 也一律按 10 跑)。
-- (double)currentFrequency { return kACDefaultFreq; }
+// 频率只有两档: 10/s 和 20/s。老版本存过的 30/50/100 不再匹配, 一律回落到 10/s。
+- (NSArray<NSNumber *> *)freqPresets { return @[@10.0, @20.0]; }
+
+- (double)currentFrequency
+{
+    NSArray<NSNumber *> *p = [self freqPresets];
+    NSInteger i = MAX(0, MIN(_freqIndex, (NSInteger)p.count - 1));
+    return p[i].doubleValue;
+}
 
 - (void)loadPrefs
 {
@@ -1310,6 +1323,14 @@ static UIWindowScene *ACAnyWindowScene(void)
         _point = CGPointMake(x, y);
     }
 
+    double f = [d doubleForKey:kACKeyFreq];
+    if (f <= 0) f = kACDefaultFreq;
+    NSArray<NSNumber *> *presets = [self freqPresets];
+    _freqIndex = 0;                              // 匹配不上(如旧的 30/50/100)就用 10/s
+    for (NSInteger i = 0; i < (NSInteger)presets.count; i++) {
+        if (fabs(presets[i].doubleValue - f) < 0.01) { _freqIndex = i; break; }
+    }
+
     _autoStopSec = [d integerForKey:kACKeyAutoStop];   // 0 = 一直不停(默认)
     if (_autoStopSec < 0) _autoStopSec = 0;
 }
@@ -1322,6 +1343,13 @@ static UIWindowScene *ACAnyWindowScene(void)
     [d setBool:YES forKey:kACKeyAimed];
     [d synchronize];
     _hasPoint = YES;
+}
+
+- (void)saveFrequency
+{
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    [d setDouble:[self currentFrequency] forKey:kACKeyFreq];
+    [d synchronize];
 }
 
 - (void)saveBallCenter:(CGPoint)c
@@ -1495,6 +1523,16 @@ static UIWindowScene *ACAnyWindowScene(void)
     [self refreshUI];
 }
 
+- (void)onFreqChanged:(UISegmentedControl *)c
+{
+    _freqIndex = c.selectedSegmentIndex;
+    [self saveFrequency];
+    ACClickEngine *eng = [ACClickEngine shared];
+    eng.frequency = [self currentFrequency];
+    if (eng.running) { [eng stop]; [eng start]; [self armAutoStop]; }   // 换频率=重新开始, 计时也重来
+    [self refreshUI];
+}
+
 #pragma mark 自动停止
 
 - (void)onAutoStopTapped:(UIButton *)b
@@ -1612,6 +1650,8 @@ static UIWindowScene *ACAnyWindowScene(void)
     _startBtn.backgroundColor = running
         ? [UIColor colorWithRed:0.78 green:0.14 blue:0.14 alpha:1.0]
         : [UIColor colorWithRed:0.16 green:0.46 blue:0.30 alpha:1.0];
+
+    _freqCtrl.selectedSegmentIndex = _freqIndex;
 
     [_autoStopBtn setTitle:[self autoStopTitleText] forState:UIControlStateNormal];
     _autoStopBtn.backgroundColor = (_autoStopSec > 0)
