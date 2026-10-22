@@ -2,7 +2,7 @@ Package: com.autoclicker.jdclicker
 Name: JDClickerSB
 Version: 1.0.11
 Architecture: iphoneos-arm64
-Description: 京东连点器 (SpringBoard 侧) —— 悬浮球/准星瞄准/10-100 次每秒/可设秒数定时自动停止; 用系统级 HID 注入触摸, 只在京东前台时显示
+Description: 京东连点器 (SpringBoard 侧) —— 悬浮球/准星瞄准/固定 10 次每秒/预设定时自动停止; 用系统级 HID 注入触摸, 只在京东前台时显示
 Maintainer: local build
 Author: local build
 Section: Tweaks

@@ -54,7 +54,9 @@ static NSString * const kJDTargetBundle = @"com.360buy.jdmobile";   // 京东
 static NSString * const kJDTargetName   = @"京东";
 
 // 62 而不是 56: 满屏撒花/弹幕的背景下小球容易被"吃掉", 稍微放大一点更好找。
-static const CGFloat kACBallSize      = 62.0;
+// 悬浮球视觉直径。1.0.2038 从 62 缩到 46: 62pt 在京东页面上挡得太多,
+// 尤其贴在右侧商品/按钮区时几乎每点一下都点在球上。46pt 仍大于 44pt 的最小触控尺寸。
+static const CGFloat kACBallSize      = 46.0;
 static const CGFloat kACMenuWidth     = 230.0;
 static const CGFloat kACMenuMargin    = 8.0;
 static const CGFloat kACCrosshairSize = 64.0;
@@ -831,11 +833,11 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
 
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event
 {
-    // 视觉 62pt, 但只有中间 52pt 接手指。
+    // 视觉 46pt, 但只有中间 40pt 接手指。
     // 理由: 球是 SpringBoard 的系统窗口, 命中优先级高于京东。如果准星标定的点击
     // 坐标刚好落在球身上, 我们注入的那一下 HID 触摸会被自己的球接住、送不到京东,
     // 等于白点一次。把热区收得比视觉小一圈, "看得见" 和 "不吞自己的点击" 就都有了。
-    return CGRectContainsPoint(CGRectInset(self.bounds, 5, 5), point);
+    return CGRectContainsPoint(CGRectInset(self.bounds, 3, 3), point);
 }
 
 - (void)setPulsing:(BOOL)pulsing
@@ -927,19 +929,17 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
     UIView              *_menu;
     UIButton            *_aimBtn;
     UIButton            *_startBtn;
-    UISegmentedControl  *_freqCtrl;
+    UILabel             *_freqLabel;       // 频率已固定 10/s, 这里只做只读显示
     UIButton            *_confirmBtn;      // 瞄准时替代菜单的「确认」小按钮
     UILabel             *_statusLabel;
     ACCrosshairView     *_crosshair;
 
     UIButton            *_autoStopBtn;     // 菜单里的「自动停止」入口
-    UIView              *_autoPanel;       // 秒数选择面板
-    UITextField         *_autoField;
+    UIView              *_autoPanel;       // 秒数选择面板(纯预设按钮, 无输入框)
 
     BOOL                 _aiming;
     CGPoint              _point;
     BOOL                 _hasPoint;
-    NSInteger            _freqIndex;
     BOOL                 _targetFront;
     NSInteger            _installRetry;
 
@@ -1106,11 +1106,11 @@ static UIWindowScene *ACAnyWindowScene(void)
     //   白描边负责在暗背景上立住, 黑影晕负责在亮背景上立住, 两边都不会糊。
     _ball.backgroundColor = [UIColor colorWithWhite:0.16 alpha:1.0];
     _ball.layer.cornerRadius = kACBallSize * 0.5;
-    _ball.layer.borderWidth = 3.0;
+    _ball.layer.borderWidth = 2.5;
     _ball.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:1.0].CGColor;
     _ball.layer.shadowColor = [UIColor blackColor].CGColor;
     _ball.layer.shadowOpacity = 0.85;
-    _ball.layer.shadowRadius = 7.0;
+    _ball.layer.shadowRadius = 5.0;
     _ball.layer.shadowOffset = CGSizeZero;
     // 给阴影一条固定的 path: 球要跟着手指拖、而且在 100/s 下一直有脉冲动画,
     // 不指定 path 的话每帧都要重新算 alpha 遮罩, 白烧 CPU(费电)。
@@ -1121,7 +1121,7 @@ static UIWindowScene *ACAnyWindowScene(void)
     _ballLabel = [[UILabel alloc] initWithFrame:_ball.bounds];
     _ballLabel.textAlignment = NSTextAlignmentCenter;
     _ballLabel.textColor = [UIColor whiteColor];
-    _ballLabel.font = [UIFont boldSystemFontOfSize:16.0];
+    _ballLabel.font = [UIFont boldSystemFontOfSize:12.5];
     _ballLabel.text = @"连点";
     _ballLabel.userInteractionEnabled = NO;
     [_ball addSubview:_ballLabel];
@@ -1169,24 +1169,19 @@ static UIWindowScene *ACAnyWindowScene(void)
     _startBtn.frame = CGRectMake(10, 56, w - 20, 40);
     [_menu addSubview:_startBtn];
 
-    _freqCtrl = [[UISegmentedControl alloc] initWithItems:@[@"10/s", @"20/s", @"30/s", @"50/s", @"100/s"]];
-    _freqCtrl.frame = CGRectMake(10, 102, w - 20, 32);
-    _freqCtrl.selectedSegmentIndex = _freqIndex;
-    // ★ 深色面板上必须显式把分段控件的文字设成白色 ★
-    //   默认是系统黑色文字, 压在 0.12 的深灰面板上几乎看不见。
-    //   5 段挤在 210pt 里, 字号收到 11.5 才不至于把 "100/s" 挤变形。
-    NSDictionary *segTextAttrs = @{
-        NSForegroundColorAttributeName: [UIColor whiteColor],
-        NSFontAttributeName: [UIFont systemFontOfSize:11.5],
-    };
-    [_freqCtrl setTitleTextAttributes:segTextAttrs forState:UIControlStateNormal];
-    [_freqCtrl setTitleTextAttributes:segTextAttrs forState:UIControlStateSelected];
-    _freqCtrl.backgroundColor = [UIColor colorWithWhite:0.26 alpha:1.0];   // 给白字一个可读的底
-    if (@available(iOS 13.0, *)) {
-        _freqCtrl.selectedSegmentTintColor = [UIColor colorWithRed:0.20 green:0.52 blue:0.96 alpha:1.0];
-    }
-    [_freqCtrl addTarget:self action:@selector(onFreqChanged:) forControlEvents:UIControlEventValueChanged];
-    [_menu addSubview:_freqCtrl];
+    // ★ 频率固定 10 次/秒, 不再给选项 ★
+    //   实测 20/s 及以上在不少页面里反而"点不动" (页面自己的防抖/滚动判定会把
+    //   过密的连点吞掉), 留着只能误导。这里改成一行只读说明, 高度沿用原来的 32pt,
+    //   省得整块面板的尺寸/坐标全要重排。
+    _freqLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 102, w - 20, 32)];
+    _freqLabel.text = @"频率: 10 次/秒 (固定)";
+    _freqLabel.textAlignment = NSTextAlignmentCenter;
+    _freqLabel.font = [UIFont boldSystemFontOfSize:13.0];
+    _freqLabel.textColor = [UIColor whiteColor];
+    _freqLabel.backgroundColor = [UIColor colorWithWhite:0.26 alpha:1.0];
+    _freqLabel.layer.cornerRadius = 7.0;
+    _freqLabel.clipsToBounds = YES;
+    [_menu addSubview:_freqLabel];
 
     _autoStopBtn = [self makeButtonWithTitle:@"自动停止: 不限" action:@selector(onAutoStopTapped:)];
     _autoStopBtn.frame = CGRectMake(10, 140, w - 20, 32);
@@ -1204,14 +1199,13 @@ static UIWindowScene *ACAnyWindowScene(void)
 }
 
 // ---- 自动停止秒数面板 ----
-// 为什么不用「UIAlertController + 文本框」而要自己搭一个面板:
-//   文本框要弹系统键盘, 而系统键盘要求所在窗口是 key window; 我们的悬浮窗不是
-//   SpringBoard 的主窗口, 去抢 key 会连带影响系统 UI, 不稳妥。
-//   所以这里以**预设按钮**为主路径 —— 完全不需要键盘; 文本框只是补充,
-//   键盘弹得出来就随便输入, 弹不出来也照样能设。
+// 只保留预设按钮, 不再提供"自定义秒数"输入框。
+// 原因(实测): 输入框点下去不弹键盘 —— 系统键盘要求所在窗口是 key window,
+// 而我们的悬浮窗是 SpringBoard 上的非 key 浮层, 抢 key 会连带影响系统 UI。
+// 所以键盘这条路本来就走不通, 干脆去掉输入框和"确定"按钮, 面板也更矮。
 - (void)buildAutoPanel
 {
-    CGFloat pw = 250.0, ph = 162.0;
+    CGFloat pw = 250.0, ph = 124.0;
     _autoPanel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, pw, ph)];
     _autoPanel.backgroundColor = [UIColor colorWithWhite:0.10 alpha:0.97];
     _autoPanel.layer.cornerRadius = 12.0;
@@ -1231,7 +1225,7 @@ static UIWindowScene *ACAnyWindowScene(void)
     hint.textColor = [UIColor colorWithWhite:0.70 alpha:1.0];
     [_autoPanel addSubview:hint];
 
-    // 预设: 两行三列, 点一下立即生效并关闭面板(不依赖键盘)
+    // 预设: 两行三列, 点一下立即生效并关闭面板
     NSArray *titles1 = @[@"10 秒", @"30 秒", @"60 秒"];
     NSArray *titles2 = @[@"2 分钟", @"5 分钟", @"不限"];
     NSArray *vals1   = @[@10, @30, @60];
@@ -1249,24 +1243,6 @@ static UIWindowScene *ACAnyWindowScene(void)
             [_autoPanel addSubview:b];
         }
     }
-
-    _autoField = [[UITextField alloc] initWithFrame:CGRectMake(12, 120, pw - 24 - 74, 32)];
-    _autoField.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1.0];
-    _autoField.textColor = [UIColor whiteColor];
-    _autoField.tintColor = [UIColor whiteColor];
-    _autoField.font = [UIFont systemFontOfSize:14.0];
-    _autoField.keyboardType = UIKeyboardTypeNumberPad;
-    _autoField.textAlignment = NSTextAlignmentCenter;
-    _autoField.placeholder = @"自定义秒数";
-    _autoField.layer.cornerRadius = 7.0;
-    _autoField.text = @"";
-    [_autoPanel addSubview:_autoField];
-
-    UIButton *ok = [self makeButtonWithTitle:@"确定" action:@selector(onAutoConfirmTapped:)];
-    ok.titleLabel.font = [UIFont boldSystemFontOfSize:14.0];
-    ok.backgroundColor = [UIColor colorWithRed:0.16 green:0.46 blue:0.30 alpha:1.0];
-    ok.frame = CGRectMake(pw - 12 - 68, 120, 68, 32);
-    [_autoPanel addSubview:ok];
 
     [_window addSubview:_autoPanel];
 }
@@ -1315,14 +1291,9 @@ static UIWindowScene *ACAnyWindowScene(void)
 
 #pragma mark 持久化
 
-- (NSArray<NSNumber *> *)freqPresets { return @[@10.0, @20.0, @30.0, @50.0, @100.0]; }
-
-- (double)currentFrequency
-{
-    NSArray<NSNumber *> *p = [self freqPresets];
-    NSInteger i = MAX(0, MIN(_freqIndex, (NSInteger)p.count - 1));
-    return p[i].doubleValue;
-}
+// 频率固定 10 次每秒: 20/s 及以上在部分页面里反而点不动, 所以只留这一个值,
+// 也不再读写 NSUserDefaults 里的旧档位 (老用户存着 50/100 也一律按 10 跑)。
+- (double)currentFrequency { return kACDefaultFreq; }
 
 - (void)loadPrefs
 {
@@ -1339,14 +1310,6 @@ static UIWindowScene *ACAnyWindowScene(void)
         _point = CGPointMake(x, y);
     }
 
-    double f = [d doubleForKey:kACKeyFreq];
-    if (f <= 0) f = kACDefaultFreq;
-    NSArray<NSNumber *> *presets = [self freqPresets];
-    _freqIndex = 0;
-    for (NSInteger i = 0; i < (NSInteger)presets.count; i++) {
-        if (fabs(presets[i].doubleValue - f) < 0.01) { _freqIndex = i; break; }
-    }
-
     _autoStopSec = [d integerForKey:kACKeyAutoStop];   // 0 = 一直不停(默认)
     if (_autoStopSec < 0) _autoStopSec = 0;
 }
@@ -1359,13 +1322,6 @@ static UIWindowScene *ACAnyWindowScene(void)
     [d setBool:YES forKey:kACKeyAimed];
     [d synchronize];
     _hasPoint = YES;
-}
-
-- (void)saveFrequency
-{
-    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    [d setDouble:[self currentFrequency] forKey:kACKeyFreq];
-    [d synchronize];
 }
 
 - (void)saveBallCenter:(CGPoint)c
@@ -1539,16 +1495,6 @@ static UIWindowScene *ACAnyWindowScene(void)
     [self refreshUI];
 }
 
-- (void)onFreqChanged:(UISegmentedControl *)c
-{
-    _freqIndex = c.selectedSegmentIndex;
-    [self saveFrequency];
-    ACClickEngine *eng = [ACClickEngine shared];
-    eng.frequency = [self currentFrequency];
-    if (eng.running) { [eng stop]; [eng start]; [self armAutoStop]; }   // 换频率=重新开始, 计时也重来
-    [self refreshUI];
-}
-
 #pragma mark 自动停止
 
 - (void)onAutoStopTapped:(UIButton *)b
@@ -1558,7 +1504,6 @@ static UIWindowScene *ACAnyWindowScene(void)
         [self refreshUI];
         return;
     }
-    _autoField.text = (_autoStopSec > 0) ? [NSString stringWithFormat:@"%ld", (long)_autoStopSec] : @"";
     _autoPanel.hidden = NO;
     [self positionAutoPanel];
     _menu.hidden = YES;                  // 面板代替菜单, 避免两块叠在一起
@@ -1575,7 +1520,6 @@ static UIWindowScene *ACAnyWindowScene(void)
 - (void)closeAutoPanel
 {
     if (_autoPanel.hidden) return;
-    [_autoField resignFirstResponder];
     _autoPanel.hidden = YES;
     _menu.hidden = NO;
     [self positionMenu];
@@ -1585,14 +1529,6 @@ static UIWindowScene *ACAnyWindowScene(void)
 - (void)onAutoPresetTapped:(UIButton *)b
 {
     [self applyAutoStopSec:b.tag];
-}
-
-- (void)onAutoConfirmTapped:(UIButton *)b
-{
-    NSInteger sec = _autoField.text.integerValue;
-    if (sec < 0) sec = 0;
-    if (sec > 6 * 3600) sec = 6 * 3600;   // 上限 6 小时, 防止手滑输入天文数字
-    [self applyAutoStopSec:sec];
 }
 
 - (void)applyAutoStopSec:(NSInteger)sec
@@ -1676,8 +1612,6 @@ static UIWindowScene *ACAnyWindowScene(void)
     _startBtn.backgroundColor = running
         ? [UIColor colorWithRed:0.78 green:0.14 blue:0.14 alpha:1.0]
         : [UIColor colorWithRed:0.16 green:0.46 blue:0.30 alpha:1.0];
-
-    _freqCtrl.selectedSegmentIndex = _freqIndex;
 
     [_autoStopBtn setTitle:[self autoStopTitleText] forState:UIControlStateNormal];
     _autoStopBtn.backgroundColor = (_autoStopSec > 0)
