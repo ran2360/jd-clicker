@@ -789,12 +789,18 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
 
 @implementation ACPassThroughWindow
 
-// 悬浮窗必须"半透明拦截": 屏幕其余部分(尤其整条底部按钮区和 Home 手势区)必须原样
-// 落到京东, 只有悬浮球/菜单/面板/确认/准星这些控件本身能接收触摸。
-// 之前只重写 hitTest: 返回 nil 不够 —— UIView 默认 pointInside: 对整窗 bounds 都
-// 返回 YES, 于是这层整屏窗口在事件链里始终参与拾取, 底部按钮名那一下触摸会被它先
-// "认领"再丢弃, 表现为京东详情页「立即购买」、「加入购物车」SKU 的「确定」点不动
-// (页面中上部滚动/点击都正常)。这就是 1.0.2039 报告的 bug。
+// ★ 关键修复 1.0.2042: 之前悬浮窗作为整屏 UIWindow 挂在 SpringBoard 上, 且有一个
+//   rootViewController —— 这让 UIKit 把它当"有 VC 的全屏窗口"塞进响应链和 key
+//   窗口候选池。iOS 16 上 SpringBoard 的事件路由一旦发现这类窗口存在, 就会改变对
+//   前台 App (京东) 的触摸投递路径, 底部区域 (详情页「立即购买」、SKU 的「确定」)
+//   的触摸被系统拦截后丢弃, 跟 pointInside/hitTest/层级都无关。
+//
+//   修复方法:
+//     1. 去掉 rootViewController —— v1.0.2 加它是当时 headerpad=0 的误判, 实际
+//        根本不需要; 没有 VC 的窗口不会被 UIKit 当成响应链候选。
+//     2. canBecomeKeyWindow 返回 NO —— 明确禁止系统把它升为 key window, 釜底抽薪。
+- (BOOL)canBecomeKeyWindow { return NO; }
+
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event
 {
     // 只有落在某个"当前可见、可交互"的自己控件上才 YES; 其余位置返回 NO, 本窗
@@ -1049,11 +1055,6 @@ static UIWindowScene *ACAnyWindowScene(void)
     win.backgroundColor = [UIColor clearColor];
     win.opaque = NO;
     win.windowLevel = ACWindowLevel();
-
-    UIViewController *root = [[UIViewController alloc] init];
-    root.view.backgroundColor = [UIColor clearColor];
-    root.view.userInteractionEnabled = NO;
-    win.rootViewController = root;
 
     _window = win;
     [self buildBall];
