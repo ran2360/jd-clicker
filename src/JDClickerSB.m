@@ -62,9 +62,15 @@ static const CGFloat kACMenuMargin    = 8.0;
 static const CGFloat kACCrosshairSize = 64.0;
 static const double  kACDefaultFreq   = 10.0;
 
-// 悬浮窗层级: 必须高于京东的窗口内容。SpringBoard 里给一个足够高的值。
-// 注意 UIWindowLevelAlert 是 extern const, 不能用于静态初始化, 所以在函数里算。
-static UIWindowLevel ACWindowLevel(void) { return UIWindowLevelAlert + 1000.0; }
+// 悬浮窗层级: 必须高于京东窗口、但又不能高到触发系统的触控保留区。
+//   旧版  UIWindowLevelAlert + 1000 (3000) —— 这个值远高于系统 Alert, 整屏窗口
+//         在这个层级上会被手势区/Home 条判定为"优先级最高的触控接收者", 即使用
+//         hitTest/pointInside 把落点放行, 系统事件投递也已锁定本窗, 底部按钮区
+//         (京东「立即购买」、SKU 的「确定」) 因此收不到触摸。
+//   现版  UIWindowLevelAlert + 100  (2100) —— 仍远高于普通 App 内容(0)和状态栏
+//         (1000)、悬浮球正常显示, 但不再触碰系统对最顶层的触控保留策略。
+//   注意 UIWindowLevelAlert 是 extern const, 不能用于静态初始化, 所以在函数里算。
+static UIWindowLevel ACWindowLevel(void) { return UIWindowLevelAlert + 100.0; }
 
 static NSString * const kACKeyPointX  = @"jd_point_x";
 static NSString * const kACKeyPointY  = @"jd_point_y";
