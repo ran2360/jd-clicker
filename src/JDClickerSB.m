@@ -782,10 +782,30 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
 @end
 
 @implementation ACPassThroughWindow
+
+// 悬浮窗必须"半透明拦截": 屏幕其余部分(尤其整条底部按钮区和 Home 手势区)必须原样
+// 落到京东, 只有悬浮球/菜单/面板/确认/准星这些控件本身能接收触摸。
+// 之前只重写 hitTest: 返回 nil 不够 —— UIView 默认 pointInside: 对整窗 bounds 都
+// 返回 YES, 于是这层整屏窗口在事件链里始终参与拾取, 底部按钮名那一下触摸会被它先
+// "认领"再丢弃, 表现为京东详情页「立即购买」、「加入购物车」SKU 的「确定」点不动
+// (页面中上部滚动/点击都正常)。这就是 1.0.2039 报告的 bug。
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event
+{
+    // 只有落在某个"当前可见、可交互"的自己控件上才 YES; 其余位置返回 NO, 本窗
+    // 完全不参与触摸判定, 触摸直接落到下面的京东。
+    for (UIView *v in self.subviews) {
+        if (v.hidden || !v.userInteractionEnabled) continue;   // 隐藏的面板/准星不算
+        CGPoint pv = [self convertPoint:point toView:v];
+        if ([v pointInside:pv withEvent:event]) return YES;
+    }
+    return NO;
+}
+
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event
 {
+    if (![self pointInside:point withEvent:event]) return nil;
     UIView *v = [super hitTest:point withEvent:event];
-    return (v == self) ? nil : v;      // 没命中可交互子视图 -> 穿透给京东
+    return (v == self) ? nil : v;      // 命中窗口本身(无子视图)也放行给京东
 }
 @end
 
