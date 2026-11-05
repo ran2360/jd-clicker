@@ -825,10 +825,24 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
     //   由于派发是串行+信号量保护, 上一次没放开时下次直接跳过,
     //   所以实际频率会自动降到 ~1/(160ms + 开销) ≈ 5~6 次/秒。
     //   对抢购/抢券这种"只要中一次就够"的场景, 5 次有效的点击远比 20 次无效的好。
+    //
+    // ★ 1.0.2048 关键修正: 必须留出"无触摸间隙", 否则用户点不到悬浮球 ★
+    //   1.0.2047 的 hold(160ms) 比点击间隔(100ms/50ms)还长, 引擎用信号量跳过重叠,
+    //   结果屏幕上**几乎永远停着一根按下的手指**, 系统始终有一路未结束的触摸会话
+    //   占着触摸焦点。用户真实手指去点悬浮球时, 球的 tap 手势判定失败 ——
+    //   表现为"停不下来, 只能关屏幕"。这是必须修掉的死锁级问题。
+    //   做法: 每次点击结束后强制等待一段"完全无触摸"的间隙, 确保系统看得到
+    //   "手指抬起 -> 空白 -> 手指按下"的完整节奏, 焦点能回到用户手指。
     const double minHoldToRegister = 0.160;      // 越过 delaysContentTouches 的门槛
     const double idealHold = MAX(minHoldToRegister, MIN(interval * 0.8, 0.300));
     const double holdSec   = idealHold;
     const useconds_t holdUs = (useconds_t)(holdSec * 1e6);
+
+    // 点击之间必须留的无触摸间隙。取 120ms: 足够让系统收尾使用会话、把焦点还给
+    // 用户手指; 又不会把整体节奏拖得太慢。于是每一轮 ≈ 160 + 120 = 280ms,
+    // 实际约 3~4 次/秒 —— 抢购这种"中一次就够"的用途完全够用, 且球随时能点。
+    const double idleGapSec = 0.120;
+    const double cycleSec   = holdSec + idleGapSec;   // 一轮的真实时长
 
     // ★ 1.0.2044: 拟人化微抖动 ★
     //   之前每次都点在**同一个像素**、按住时长为**同一个值**, 而且定时器是
@@ -844,8 +858,12 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
     _slot  = dispatch_semaphore_create(1);
     _queue = dispatch_queue_create("com.jdclicker.sb", DISPATCH_QUEUE_SERIAL);
     _timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _queue);
+    // ★ 定时器周期取 max(用户设定间隔, 一整轮的真实时长) ★
+    //   如果还按 interval 走, 160ms 的按住会跨过下一个 tick, 信号量就会跳过,
+    //   手指长期压在屏幕上 -> 焦点被抢走。取 cycleSec 保证每轮之间有明确的空白期。
+    const double tickSec = MAX(interval, cycleSec);
     dispatch_source_set_timer(_timer, dispatch_time(DISPATCH_TIME_NOW, 0),
-                              (uint64_t)(interval * (double)NSEC_PER_SEC), 0);
+                              (uint64_t)(tickSec * (double)NSEC_PER_SEC), 0);
 
     __weak ACClickEngine *weakSelf = self;
     dispatch_semaphore_t slot = _slot;
@@ -868,13 +886,19 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
 
         // HID 派发不要求主线程, 直接在当前队列做
         [[ACTouchInjector shared] tapAtPoint:jittered phaseDelay:actualHold];
+
+        // ★ 抬起之后强制留一段无触摸间隙 ★
+        //   这一段里屏幕上没有任何注入触摸, 系统能正常收尾这次会话并把触摸焦点
+        //   交还给用户手指 —— 用户随时能点悬浮球停止。
+        usleep((useconds_t)(idleGapSec * 1e6));
+
         dispatch_semaphore_signal(slot);
     });
     dispatch_resume(_timer);
 
-    AC_LOG(@"开始连点: 位置=(%.0f, %.0f)±1.5pt 频率=%.0f/s 按住时长=%ldus±25%% (下限 160ms, 无移动事件)",
-           p.x, p.y, f, (long)holdUs);
-    AC_LOG(@"说明: 按住 ≥160ms 才能越过 UIScrollView 的触摸延迟门槛, 因此实际点击频率会自动降到约 5~6 次/秒 —— 这是为了让每一下都真正算一次点击");
+    AC_LOG(@"开始连点: 位置=(%.0f, %.0f)±1.5pt 按住时长=%ldus 间隙=%ldus 实际约 %.1f 次/秒",
+           p.x, p.y, (long)holdUs, (long)(idleGapSec * 1e6), 1.0 / tickSec);
+    AC_LOG(@"说明: 按住 ≥160ms 越过 UIScrollView 触摸延迟门槛; 每轮之间留 120ms 无触摸间隙, 保证悬浮球随时可点停止");
     if (self.onStateChange) self.onStateChange(YES);
     return YES;
 }
@@ -1120,7 +1144,28 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
         dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf refreshUI]; });
     };
 
+    // ★ 1.0.2048: 音量键作为"物理保底停止" ★
+    //   1.0.2047 出过一次严重问题: 按住时长比点击间隔还长, 屏幕上几乎永远压着一根
+    //   注入手指, 触摸焦点被占住, 用户点悬浮球完全没反应, 只能关屏幕。
+    //   那一版已经修了(加了无触摸间隙), 但这里再加一道**完全不依赖触摸**的退路:
+    //   连点运行中按任意音量键 => 立即停止。
+    //   在 SpringBoard 里监听系统音量变化通知即可, 不需要额外 frameWork。
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(onSystemVolumeChanged:)
+                                                 name:@"AVSystemController_SystemVolumeDidChangeNotification"
+                                               object:nil];
+
     [self scheduleInstallRetry];
+}
+
+- (void)onSystemVolumeChanged:(NSNotification *)n
+{
+    if (![ACClickEngine shared].running) return;      // 没在连点就不管
+    AC_LOG(@"音量键触发: 立即停止连点 (物理保底)");
+    [self disarmAutoStop];
+    [[ACClickEngine shared] stop];
+    _menu.hidden = YES;
+    [self refreshUI];
 }
 
 - (void)scheduleInstallRetry
