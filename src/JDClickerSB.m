@@ -79,7 +79,7 @@ static NSString * const kACKeyBallX   = @"jd_ball_x";
 static NSString * const kACKeyBallY   = @"jd_ball_y";
 static NSString * const kACKeyAimed   = @"jd_aimed";
 static NSString * const kACKeyAutoStop = @"jd_autostop";   // 自动停止秒数, 0 = 一直不停
-static NSString * const kACKeyAlwaysShow = @"jd_always_show_ball";  // 1 = 全系统显示(调试用)
+
 
 // ===========================================================================
 // MARK: - 日志 (写文件, Filza 直接可看)
@@ -806,18 +806,28 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
     const double  f = MAX(1.0, _frequency);
     const double  interval = 1.0 / f;
 
-    // ★ 单次"按住"时长 (不是移动间隔, 现在序列里已经没有 Moved 了) ★
-    //   要同时满足两个目标:
-    //     a) 必须小于点击间隔, 否则定时器到期时上一次还没放开, 会拖垮设定频率;
-    //     b) 必须"够长", 让它看起来像真人短按 —— 真人短按在 50~100ms 量级,
-    //        而 app 的 UIScrollView(delaysContentTouches) 会把过短的按压判成误触
-    //        或拖动预备, 从而取消按钮的 touchUpInside。这正是「价格能点、抢购按钮
-    //        点不动」的原因。
-    //   取法: hold = min(点击间隔的 70%, 60ms), 下限 8ms。于是
-    //     10/s (100ms 间隔) -> hold 60ms   (真人短按量级, 舒适)
-    //     20/s ( 50ms 间隔) -> hold 35ms   (仍是可识别的一次按压, 且不超时)
-    const double idealHold = MIN(interval * 0.7, 0.060);
-    const double holdSec   = MAX(0.008, idealHold);
+    // ★ 单次"按住"时长 —— 1.0.2047 起改为"优先保证能被识别" ★
+    //   这是本项目最反直觉的一个结论, 必须写清楚:
+    //
+    //   iOS 的 UIScrollView 默认 delaysContentTouches=YES, 会把触摸**延迟约 150ms**
+    //   才交给内部子视图, 用以区分"点击"和"拖动"。如果一次按压在 150ms 内就抬起,
+    //   滚动视图直接判定为快速掠过 -> 取消子视图触摸跟踪 -> UIButton 的
+    //   touchUpInside 永不触发。而价格文字那种直接挂手势的目标不走这条延迟链,
+    //   所以照样响应 —— 这就是「同样的坐标, 价格能点、抢购按钮点不动」的由来。
+    //
+    //   由此得出一个硬约束: 按住时长必须 ≥ ~160ms 才可能点中滚动视图里的按钮。
+    //   而点击间隔 = 1/频率, 按 10/s(100ms)、20/s(50ms) 算, 间隔本身都比 160ms 短,
+    //   所以**在这种频率下无论怎么调都不可能点中按钮** —— 频率越高越点不动,
+    //   和你实测"20/s 在有些场景没作用"完全对得上。
+    //
+    //   现在的取舍: 宁可降低实际点击频率, 也要保证每一下都"算一次点击"。
+    //   按住时长固定取 160ms(越过门槛), 频率只决定定时器**尝试**的节奏;
+    //   由于派发是串行+信号量保护, 上一次没放开时下次直接跳过,
+    //   所以实际频率会自动降到 ~1/(160ms + 开销) ≈ 5~6 次/秒。
+    //   对抢购/抢券这种"只要中一次就够"的场景, 5 次有效的点击远比 20 次无效的好。
+    const double minHoldToRegister = 0.160;      // 越过 delaysContentTouches 的门槛
+    const double idealHold = MAX(minHoldToRegister, MIN(interval * 0.8, 0.300));
+    const double holdSec   = idealHold;
     const useconds_t holdUs = (useconds_t)(holdSec * 1e6);
 
     // ★ 1.0.2044: 拟人化微抖动 ★
@@ -852,7 +862,9 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
 
         const double hr = ((double)arc4random_uniform(2001) / 1000.0 - 1.0) * holdJitterRatio;
         useconds_t actualHold = (useconds_t)((double)holdUs * (1.0 + hr));
-        if (actualHold < 3000) actualHold = 3000;
+        // 抖动后的下限也不能掉到 160ms 门槛以下, 否则那一下又变成"无效点击"。
+        const useconds_t floorUs = (useconds_t)(minHoldToRegister * 1e6);
+        if (actualHold < floorUs) actualHold = floorUs;
 
         // HID 派发不要求主线程, 直接在当前队列做
         [[ACTouchInjector shared] tapAtPoint:jittered phaseDelay:actualHold];
@@ -860,8 +872,9 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
     });
     dispatch_resume(_timer);
 
-    AC_LOG(@"开始连点: 位置=(%.0f, %.0f)±1.5pt 频率=%.0f/s 按住时长=%ldus±25%% (无移动事件, 已拟人化)",
+    AC_LOG(@"开始连点: 位置=(%.0f, %.0f)±1.5pt 频率=%.0f/s 按住时长=%ldus±25%% (下限 160ms, 无移动事件)",
            p.x, p.y, f, (long)holdUs);
+    AC_LOG(@"说明: 按住 ≥160ms 才能越过 UIScrollView 的触摸延迟门槛, 因此实际点击频率会自动降到约 5~6 次/秒 —— 这是为了让每一下都真正算一次点击");
     if (self.onStateChange) self.onStateChange(YES);
     return YES;
 }
@@ -1195,11 +1208,12 @@ static UIWindowScene *ACAnyWindowScene(void)
     // 「仅京东显示」: 只有**确认**京东在前台时才显示;
     // 检测手段不可用(未知)时**也显示**, 免得球藏起来后用户点不到它 (1.0.10 的教训)。
     //
-    // ★ 1.0.2046: 长按球 2 秒可以切到「全系统显示」★
-    //   调试时需要在桌面/别的 App 里验证合成触摸是否有效, 而默认只在京东显示
-    //   会让球在桌面完全看不到。开关存在 NSUserDefaults 里, 注销后仍保留。
-    BOOL alwaysShow = [[NSUserDefaults standardUserDefaults] boolForKey:kACKeyAlwaysShow];
-    BOOL shouldShow = alwaysShow || (probe != ACFrontProbeNo);
+    // 1.0.2047: 移除了 1.0.2046 的「长按切换全系统显示」。
+    //   那个功能实测长按手势打不出来(球太小 + 与拖动手势冲突), 而开关一旦被
+    //   写进 NSUserDefaults 就无法再切回来, 导致球永久显示在桌面。已删除该功能,
+    //   并在这里无条件忽略残留的旧开关值, 保证回到「仅京东显示」。
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"jd_always_show_ball"];
+    BOOL shouldShow = (probe != ACFrontProbeNo);
 
     if (front != _targetFront) {
         _targetFront = front;
@@ -1262,15 +1276,6 @@ static UIWindowScene *ACAnyWindowScene(void)
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(onBallTap:)];
     [tap requireGestureRecognizerToFail:pan];
     [_ball addGestureRecognizer:tap];
-
-    // 长按 2 秒 = 切换「仅京东显示 / 全系统显示」。
-    // 默认只在京东显示; 需要在桌面等其它地方验证功能时, 先在京东里长按球切过去。
-    UILongPressGestureRecognizer *longPress =
-        [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(onBallLongPress:)];
-    longPress.minimumPressDuration = 2.0;
-    longPress.allowableMovement = 20.0;
-    [longPress requireGestureRecognizerToFail:pan];
-    [_ball addGestureRecognizer:longPress];
 
     [self placeBallFromPrefs];
     [_window addSubview:_ball];
@@ -1573,28 +1578,6 @@ static UIWindowScene *ACAnyWindowScene(void)
         if (!_menu.hidden) [self positionMenu];
     }
     [self refreshUI];
-}
-
-- (void)onBallLongPress:(UILongPressGestureRecognizer *)g
-{
-    if (g.state != UIGestureRecognizerStateBegan) return;
-
-    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    BOOL now = ![d boolForKey:kACKeyAlwaysShow];
-    [d setBool:now forKey:kACKeyAlwaysShow];
-    [d synchronize];
-
-    AC_LOG(@"全系统显示已%@ (长按球 2 秒切换) —— 现在是%@",
-           now ? @"开启" : @"关闭", now ? @"桌面也能看到球" : @"只在京东显示");
-
-    // 立刻生效, 不用等下一次轮询
-    _window.hidden = !(now || _targetFront);
-    [self refreshUI];
-
-    // 给用户一个可见的反馈: 球短暂变亮
-    _ball.backgroundColor = [UIColor colorWithRed:0.20 green:0.52 blue:0.96 alpha:1.0];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ [self refreshUI]; });
 }
 
 - (void)onCrosshairPan:(UIPanGestureRecognizer *)g
