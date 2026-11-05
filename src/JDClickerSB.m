@@ -109,15 +109,26 @@ static NSString *ACLogFilePath(void)
 
 static void ACLogAppend(NSString *line)
 {
-    NSString *p = ACLogFilePath();
-    if (!p) return;
-    @try {
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
-        if (!fh) return;
-        [fh seekToEndOfFile];
-        [fh writeData:[[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]];
-        [fh closeFile];
-    } @catch (NSException *e) { }
+    // ★ 线程安全 ★
+    //   日志会被两个线程同时写: 主线程(UI 事件/前后台状态) 和 连点定时器所在的
+    //   串行队列(每 10 次派发一条)。之前的实现没有加锁, 两条 writeData 交错时
+    //   会在文件里拼出半截行(实测日志里出现过 "20/s 按住时长=35000us (无移动事件)"
+    //   这种丢了前半段的残缺行)。用 @synchronized 串行化即可。
+    static NSObject *lock = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ lock = [NSObject new]; });
+
+    @synchronized (lock) {
+        NSString *p = ACLogFilePath();
+        if (!p) return;
+        @try {
+            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
+            if (!fh) return;
+            [fh seekToEndOfFile];
+            [fh writeData:[[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+        } @catch (NSException *e) { }
+    }
 }
 
 #define AC_LOG(fmt, ...)                                                        \
@@ -243,7 +254,15 @@ static CGSize ACScreenFixedSize(void)
 //   2. 手指用 13 参数的 IOHIDEventCreateDigitizerFingerEvent (不是 WithQuality);
 //   3. 手事件 index=99, identity=1, eventMask=0;
 //   4. 补上 digitizer 字段 0x4 / 0xb0007 / 0xb0008 / 0xb0009 / 0xb0014 / 0xb0015。
-static IOHIDEventRef ACCreateHIDEvent(CGPoint point, UITouchPhase phase, BOOL useSenderID)
+//
+// ★ 1.0.2044: 每次点击用**不同的手指 identity** ★
+//   之前所有点击都用恒定的 identity=3。系统视角里这等于"同一根手指永远不离开屏幕、
+//   只是反复颤动", 很多手势识别器(尤其要求干净单次 tap 的按钮)会把它当陈旧/重复
+//   事件丢弃 —— 而普通视图/价格文字那种宽松的目标仍然会响应。
+//   真人每点一下都是一根新的手指(identity 递增), 所以真实手指操作始终正常。
+//   现在由引擎每次递增 identity, 每一"下"都是独立的一次触碰。
+static IOHIDEventRef ACCreateHIDEventWithFinger(CGPoint point, UITouchPhase phase,
+                                                uint32_t fingerId)
 {
     if (!pCreateDigitizerEvent || !pCreateFingerEvent) return NULL;
 
@@ -279,8 +298,10 @@ static IOHIDEventRef ACCreateHIDEvent(CGPoint point, UITouchPhase phase, BOOL us
     IOHIDFloat nx = (sz.width  > 0) ? (IOHIDFloat)(point.x / sz.width)  : 0.0;
     IOHIDFloat ny = (sz.height > 0) ? (IOHIDFloat)(point.y / sz.height) : 0.0;
 
+    if (fingerId < 1) fingerId = 1;
+
     IOHIDEventRef finger = pCreateFingerEvent(kCFAllocatorDefault, ts,
-                                              1, 3, mask,
+                                              1, fingerId, mask,
                                               nx, ny, 0.0,
                                               0.0, 0.0,
                                               range, touch, 0);
@@ -298,7 +319,7 @@ static IOHIDEventRef ACCreateHIDEvent(CGPoint point, UITouchPhase phase, BOOL us
         pEventSetIntegerValue(hand, 0xb0008, 0x1);
         pEventSetIntegerValue(hand, 0xb0009, 0x1);
     }
-    if (useSenderID && pEventSetSenderID) {
+    if (pEventSetSenderID) {
         pEventSetSenderID(hand, kACSyntheticSenderID);
     }
     return hand;
@@ -327,6 +348,7 @@ static IOHIDEventRef ACCreateHIDEvent(CGPoint point, UITouchPhase phase, BOOL us
     NSInteger                 _dispatchCount;
     NSTimeInterval            _dispatchStart;      // 首次派发的时刻(CACurrentMediaTime)
     NSTimeInterval            _lastLogAt;          // 上次打"仍在派发"日志的派发序号时间
+    uint32_t                  _fingerId;           // 当前这一"下"的手指身份, 每轮递增
 }
 
 + (instancetype)shared
@@ -351,6 +373,7 @@ static IOHIDEventRef ACCreateHIDEvent(CGPoint point, UITouchPhase phase, BOOL us
     _dispatchCount = 0;
     _dispatchStart = 0;
     _lastLogAt = 0;
+    _fingerId = 0;
 }
 
 - (NSString *)diagnostics
@@ -427,21 +450,26 @@ static IOHIDEventRef ACCreateHIDEvent(CGPoint point, UITouchPhase phase, BOOL us
         //     b) 总时长仍小于点击间隔, 不会拖垮设定频率。
         const useconds_t d = phaseDelayUs ?: (30 * 1000);
 
-        IOHIDEventRef began = ACCreateHIDEvent(point, UITouchPhaseBegan, YES);
+        // ★ 每一"下"用递增的手指身份 ★
+        //   真人每点一次都是一根新手指; 恒定 identity 会让系统把手势识别成
+        //   "同一根手指一直没离开屏幕在颤动", 按钮的干净 tap 判定因此不触发。
+        _fingerId++;
+        if (_fingerId > 1000) _fingerId = 1;               // 保持在合理的 id 范围内
+        const uint32_t fid = _fingerId;
+
+        IOHIDEventRef began = ACCreateHIDEventWithFinger(point, UITouchPhaseBegan, fid);
         if (began) { pSystemClientDispatch(_client, began); CFRelease(began); }
 
         usleep(d);    // 按住不放 —— 这一步就是"这一下是点击"的证据
 
-        IOHIDEventRef ended = ACCreateHIDEvent(point, UITouchPhaseEnded, YES);
+        IOHIDEventRef ended = ACCreateHIDEventWithFinger(point, UITouchPhaseEnded, fid);
         if (ended) { pSystemClientDispatch(_client, ended); CFRelease(ended); }
 
         if (_dispatchCount <= 4) {
             CGSize sz = ACScreenFixedSize();
-            AC_LOG(@"派发 #%ld: 点=(%.0f, %.0f) 归一化=(%.4f, %.4f) 屏=%.0fx%.0f 按下时长=%ldus 序列=下-抬(无移动) began/ended=%@/%@ client=%@",
+            AC_LOG(@"派发 #%ld: 点=(%.0f, %.0f) 按住=%ldus 手指id=%u 序列=下-抬 began/ended=%@/%@ client=%@",
                    (long)_dispatchCount, point.x, point.y,
-                   sz.width > 0 ? point.x / sz.width : 0.0,
-                   sz.height > 0 ? point.y / sz.height : 0.0,
-                   sz.width, sz.height, (long)d,
+                   (long)d, fid,
                    began ? @"建好" : @"失败", ended ? @"建好" : @"失败",
                    self.clientKind);
         }
@@ -788,6 +816,17 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
     const double holdSec   = MAX(0.008, idealHold);
     const useconds_t holdUs = (useconds_t)(holdSec * 1e6);
 
+    // ★ 1.0.2044: 拟人化微抖动 ★
+    //   之前每次都点在**同一个像素**、按住时长为**同一个值**, 而且定时器是
+    //   dispatch_source 的固定周期 —— 机器特征太干净。秒杀/抢券这类按钮普遍有
+    //   服务端风控(同一坐标、同一节奏、瞬时高频 = 脚本), 会被判成机器人而不响应。
+    //   现在：
+    //     · 坐标每次随机偏移 ±1.5pt (远小于按钮尺寸, 但足以打散像素指纹);
+    //     · 按住时长在 ±25% 内随机。
+    //   真手指抖动本来就比这大。视觉上完全看不出差别。
+    const double jitterPt = 1.5;
+    const double holdJitterRatio = 0.25;
+
     _slot  = dispatch_semaphore_create(1);
     _queue = dispatch_queue_create("com.jdclicker.sb", DISPATCH_QUEUE_SERIAL);
     _timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _queue);
@@ -800,13 +839,25 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
         ACClickEngine *sself = weakSelf;
         if (!sself || !sself->_timer) return;
         if (dispatch_semaphore_wait(slot, DISPATCH_TIME_NOW) != 0) return;
+
+        // 每次点击都在基准点附近做一点随机抖动(±1.5pt), 并随机化按住时长(±25%)。
+        // 目的: 不要在任何维度上呈现"每次完全相同"的机器特征。
+        const double jx = ((double)arc4random_uniform(2001) / 1000.0 - 1.0) * jitterPt;
+        const double jy = ((double)arc4random_uniform(2001) / 1000.0 - 1.0) * jitterPt;
+        CGPoint jittered = CGPointMake(p.x + jx, p.y + jy);
+
+        const double hr = ((double)arc4random_uniform(2001) / 1000.0 - 1.0) * holdJitterRatio;
+        useconds_t actualHold = (useconds_t)((double)holdUs * (1.0 + hr));
+        if (actualHold < 3000) actualHold = 3000;
+
         // HID 派发不要求主线程, 直接在当前队列做
-        [[ACTouchInjector shared] tapAtPoint:p phaseDelay:holdUs];
+        [[ACTouchInjector shared] tapAtPoint:jittered phaseDelay:actualHold];
         dispatch_semaphore_signal(slot);
     });
     dispatch_resume(_timer);
 
-    AC_LOG(@"开始连点: 位置=(%.0f, %.0f) 频率=%.0f/s 按住时长=%ldus (无移动事件)", p.x, p.y, f, (long)holdUs);
+    AC_LOG(@"开始连点: 位置=(%.0f, %.0f)±1.5pt 频率=%.0f/s 按住时长=%ldus±25%% (无移动事件, 已拟人化)",
+           p.x, p.y, f, (long)holdUs);
     if (self.onStateChange) self.onStateChange(YES);
     return YES;
 }
