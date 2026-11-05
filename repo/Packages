@@ -1,28 +1,28 @@
 Package: com.autoclicker.jdclicker
-Version: 1.0.2047
+Version: 1.0.2048
 Architecture: iphoneos-arm64
 Maintainer: local build
 Installed-Size: 268
-Filename: ./com.autoclicker.jdclicker_1.0.2047_iphoneos-arm64.deb
-Size: 32830
-MD5sum: 7559f713f5e2387d86fc13659e46a82a
-SHA1: 7ea51be9d6b60d37112fc50bcf6c266493e65ec9
-SHA256: 52767de40a52b23e9f9c3f9b224bc091b52ba563805dce35f8dc5256504ab3b2
+Filename: ./com.autoclicker.jdclicker_1.0.2048_iphoneos-arm64.deb
+Size: 33176
+MD5sum: b5dbe02b972882f46b1c781d6b0558d4
+SHA1: 2e398f65a47313e39246d8c7968539ab0f20659f
+SHA256: 2c85e8e827464cd7911493678596f8f856c30a1f156089b24ba7957281f2289d
 Section: Tweaks
 Name: JDClickerSB
 Author: local build
 Description: 京东连点器 (SpringBoard 侧) —— 悬浮球/准星瞄准/10-20 次每秒/预设定时自动停止; 用系统级 HID 注入触摸, 只在京东前台时显示
 
 Package: com.autoclicker.jdclicker
-Version: 1.0.2047
+Version: 1.0.2048
 Architecture: iphoneos-arm64e
 Maintainer: local build
 Installed-Size: 268
-Filename: ./com.autoclicker.jdclicker_1.0.2047_iphoneos-arm64e.deb
-Size: 32714
-MD5sum: 70a52a9a6eb2bbeb562a7546e6b500e1
-SHA1: ebeaad32a2c06130ed117457882622017477b790
-SHA256: 142942088718791189408b63238a56288af3afd74bccdbe1ac80c0630ef0dd6a
+Filename: ./com.autoclicker.jdclicker_1.0.2048_iphoneos-arm64e.deb
+Size: 33066
+MD5sum: f080a404c585d1814760a27420b5be4c
+SHA1: cb1b99df0532761efb4d74558fc0693c6cd17df8
+SHA256: c52306de731ca4a650fb1486c728db6021e26821e8f513165fdadc0b399013ae
 Section: Tweaks
 Name: JDClickerSB
 Author: local build
