@@ -79,6 +79,7 @@ static NSString * const kACKeyBallX   = @"jd_ball_x";
 static NSString * const kACKeyBallY   = @"jd_ball_y";
 static NSString * const kACKeyAimed   = @"jd_aimed";
 static NSString * const kACKeyAutoStop = @"jd_autostop";   // 自动停止秒数, 0 = 一直不停
+static NSString * const kACKeyAlwaysShow = @"jd_always_show_ball";  // 1 = 全系统显示(调试用)
 
 // ===========================================================================
 // MARK: - 日志 (写文件, Filza 直接可看)
@@ -1193,7 +1194,12 @@ static UIWindowScene *ACAnyWindowScene(void)
 
     // 「仅京东显示」: 只有**确认**京东在前台时才显示;
     // 检测手段不可用(未知)时**也显示**, 免得球藏起来后用户点不到它 (1.0.10 的教训)。
-    BOOL shouldShow = (probe != ACFrontProbeNo);
+    //
+    // ★ 1.0.2046: 长按球 2 秒可以切到「全系统显示」★
+    //   调试时需要在桌面/别的 App 里验证合成触摸是否有效, 而默认只在京东显示
+    //   会让球在桌面完全看不到。开关存在 NSUserDefaults 里, 注销后仍保留。
+    BOOL alwaysShow = [[NSUserDefaults standardUserDefaults] boolForKey:kACKeyAlwaysShow];
+    BOOL shouldShow = alwaysShow || (probe != ACFrontProbeNo);
 
     if (front != _targetFront) {
         _targetFront = front;
@@ -1256,6 +1262,15 @@ static UIWindowScene *ACAnyWindowScene(void)
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(onBallTap:)];
     [tap requireGestureRecognizerToFail:pan];
     [_ball addGestureRecognizer:tap];
+
+    // 长按 2 秒 = 切换「仅京东显示 / 全系统显示」。
+    // 默认只在京东显示; 需要在桌面等其它地方验证功能时, 先在京东里长按球切过去。
+    UILongPressGestureRecognizer *longPress =
+        [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(onBallLongPress:)];
+    longPress.minimumPressDuration = 2.0;
+    longPress.allowableMovement = 20.0;
+    [longPress requireGestureRecognizerToFail:pan];
+    [_ball addGestureRecognizer:longPress];
 
     [self placeBallFromPrefs];
     [_window addSubview:_ball];
@@ -1560,6 +1575,28 @@ static UIWindowScene *ACAnyWindowScene(void)
     [self refreshUI];
 }
 
+- (void)onBallLongPress:(UILongPressGestureRecognizer *)g
+{
+    if (g.state != UIGestureRecognizerStateBegan) return;
+
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    BOOL now = ![d boolForKey:kACKeyAlwaysShow];
+    [d setBool:now forKey:kACKeyAlwaysShow];
+    [d synchronize];
+
+    AC_LOG(@"全系统显示已%@ (长按球 2 秒切换) —— 现在是%@",
+           now ? @"开启" : @"关闭", now ? @"桌面也能看到球" : @"只在京东显示");
+
+    // 立刻生效, 不用等下一次轮询
+    _window.hidden = !(now || _targetFront);
+    [self refreshUI];
+
+    // 给用户一个可见的反馈: 球短暂变亮
+    _ball.backgroundColor = [UIColor colorWithRed:0.20 green:0.52 blue:0.96 alpha:1.0];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ [self refreshUI]; });
+}
+
 - (void)onCrosshairPan:(UIPanGestureRecognizer *)g
 {
     CGPoint t = [g translationInView:_window];
@@ -1814,6 +1851,8 @@ __attribute__((constructor))
 static void JDClickerInit(void)
 {
     AC_LOG(@"constructor (dyld 初始化阶段)");
+    // 编译时间戳: 以后不用猜装的是哪一版, 日志第一行就能对上百
+    AC_LOG(@"构建时间: %s %s", __DATE__, __TIME__);
     AC_LOG(@"文件日志: %@", ACLogFilePath() ?: @"(写不进去, 只能看 syslog)");
 
     dispatch_async(dispatch_get_main_queue(), ^{
