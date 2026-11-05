@@ -312,8 +312,11 @@ static IOHIDEventRef ACCreateHIDEvent(CGPoint point, UITouchPhase phase, BOOL us
 @property (nonatomic, assign, readonly) BOOL ready;
 @property (nonatomic, readonly) NSString *diagnostics;
 @property (nonatomic, readonly) NSString *clientKind;
+@property (nonatomic, readonly) NSInteger dispatchCount;
+@property (nonatomic, readonly) NSTimeInterval dispatchElapsed;   // 从开始连点至今的秒数
 + (instancetype)shared;
 - (void)prepare;
+- (void)resetDispatchStats;
 - (void)tapAtPoint:(CGPoint)point phaseDelay:(useconds_t)phaseDelayUs;
 @end
 
@@ -322,6 +325,8 @@ static IOHIDEventRef ACCreateHIDEvent(CGPoint point, UITouchPhase phase, BOOL us
     IOHIDEventSystemClientRef _client;
     NSString                 *_clientKind;
     NSInteger                 _dispatchCount;
+    NSTimeInterval            _dispatchStart;      // 首次派发的时刻(CACurrentMediaTime)
+    NSTimeInterval            _lastLogAt;          // 上次打"仍在派发"日志的派发序号时间
 }
 
 + (instancetype)shared
@@ -332,6 +337,21 @@ static IOHIDEventRef ACCreateHIDEvent(CGPoint point, UITouchPhase phase, BOOL us
 }
 
 - (NSString *)clientKind { return _clientKind ?: @"(无)"; }
+- (NSInteger)dispatchCount { return _dispatchCount; }
+- (NSTimeInterval)dispatchElapsed
+{
+    if (_dispatchStart <= 0) return 0;
+    return CACurrentMediaTime() - _dispatchStart;
+}
+
+// 每次「开始连点」都清零, 这样日志里的序号和时间都是从本轮开始算的,
+// 方便和手机屏幕上的秒杀倒计时对齐。
+- (void)resetDispatchStats
+{
+    _dispatchCount = 0;
+    _dispatchStart = 0;
+    _lastLogAt = 0;
+}
 
 - (NSString *)diagnostics
 {
@@ -359,7 +379,7 @@ static IOHIDEventRef ACCreateHIDEvent(CGPoint point, UITouchPhase phase, BOOL us
 - (void)prepare
 {
     [self buildClient];
-    _dispatchCount = 0;
+    [self resetDispatchStats];
 }
 
 - (BOOL)ready
@@ -373,38 +393,56 @@ static IOHIDEventRef ACCreateHIDEvent(CGPoint point, UITouchPhase phase, BOOL us
     if (!self.ready) return;
 
     _dispatchCount++;
+    NSTimeInterval now = CACurrentMediaTime();
+    if (_dispatchStart <= 0) _dispatchStart = now;
+
+    // ★ 1.0.2043 诊断: 每 10 次派发留一条带时间戳的日志 ★
+    //   用途: 判断"抢购/下单点击无效"到底是 我们没把触摸发出去, 还是京东收到后
+    //   主动不响应。把日志时间和手机屏幕上的倒计时对齐即可定性:
+    //     - 抢购那几秒里序号仍在稳步上升 -> 触摸确实一直在发, 京东侧拦截;
+    //     - 序号在那几秒停住 -> 是我们的定时器/主线程被卡住, 才能算代码 bug。
+    const BOOL tickLog = (_dispatchCount % 10 == 1) && (now - _lastLogAt >= 0.05);
+    if (tickLog) {
+        _lastLogAt = now;
+        AC_LOG(@"派发进行中 #%ld (已运行 %.1f 秒)",
+               (long)_dispatchCount, now - _dispatchStart);
+    }
 
     @try {
-        // 一次点击 = 按下 -> 移动 -> 抬起。
+        // 一次点击 = 按下 -> (保持) -> 抬起。
         //
-        // ★ 这里的间隔直接决定了**有效频率上限** ★
-        //   最初各隔 50ms, 一次点击固定耗时 ~100ms, 于是 10/20/30/50 全都塌缩成
-        //   ~10 次/秒 —— 这就是"设什么频率都一样"的根本原因(不是 iOS 的硬性上限)。
-        //   现在由调用方按频率算好传进来: 10~50/s 用 6ms, 100/s 自动压到 ~2.5ms,
-        //   这样 10/20/30/50/100 五档才都能真正跑到。
-        //   仍然保留很短的间隔(不是 0), 是为了让 down/move/up 成为三个可区分的事件,
-        //   否则会被系统合并掉 —— 这一点是实测得出的, 不能去掉。
-        const useconds_t d = phaseDelayUs ?: (6 * 1000);
+        // ★ 1.0.2043 关键改动: 去掉了中间那个 Moved 事件 ★
+        //   之前的序列是 按下 -> 移动(坐标完全相同) -> 抬起, 每个相位只隔 6ms,
+        //   总按下时长仅 12ms。这在京东这种"页面几乎全是 UIScrollView"的 App 上
+        //   会踩到 delaysContentTouches 的坑:
+        //     滚动视图一旦收到 touchesMoved(哪怕位移为 0), 就会认为用户开始拖动,
+        //     从而取消内部 UIButton 的触摸跟踪 -> touchUpInside 永不触发 -> 点了没反应。
+        //   而价格文字那种直接挂手势的表视图不走这条延迟链, 所以照样能点 ——
+        //   这正是"同样的坐标, 价格能点、抢购按钮点不动"的由来。
+        //   真人短按根本不会产生 Moved 事件, 所以真实手指点击一直正常。
+        //
+        //   现在按真人的方式: 按下 -> 保持 hold 毫秒 -> 抬起, 无移动。
+        //   hold 由调用方按频率算好(见 ACClickEngine start), 保证:
+        //     a) 时长贴近真人短按(几十毫秒量级), 足以让 delaysContentTouches 放行;
+        //     b) 总时长仍小于点击间隔, 不会拖垮设定频率。
+        const useconds_t d = phaseDelayUs ?: (30 * 1000);
 
         IOHIDEventRef began = ACCreateHIDEvent(point, UITouchPhaseBegan, YES);
         if (began) { pSystemClientDispatch(_client, began); CFRelease(began); }
-        usleep(d);
 
-        IOHIDEventRef moved = ACCreateHIDEvent(point, UITouchPhaseMoved, YES);
-        if (moved) { pSystemClientDispatch(_client, moved); CFRelease(moved); }
-        usleep(d);
+        usleep(d);    // 按住不放 —— 这一步就是"这一下是点击"的证据
 
         IOHIDEventRef ended = ACCreateHIDEvent(point, UITouchPhaseEnded, YES);
         if (ended) { pSystemClientDispatch(_client, ended); CFRelease(ended); }
 
         if (_dispatchCount <= 4) {
             CGSize sz = ACScreenFixedSize();
-            AC_LOG(@"派发 #%ld: 点=(%.0f, %.0f) 归一化=(%.4f, %.4f) 屏=%.0fx%.0f 相位间隔=%ldus began/moved/ended=%@/%@/%@ client=%@",
+            AC_LOG(@"派发 #%ld: 点=(%.0f, %.0f) 归一化=(%.4f, %.4f) 屏=%.0fx%.0f 按下时长=%ldus 序列=下-抬(无移动) began/ended=%@/%@ client=%@",
                    (long)_dispatchCount, point.x, point.y,
                    sz.width > 0 ? point.x / sz.width : 0.0,
                    sz.height > 0 ? point.y / sz.height : 0.0,
                    sz.width, sz.height, (long)d,
-                   began ? @"建好" : @"失败", moved ? @"建好" : @"失败", ended ? @"建好" : @"失败",
+                   began ? @"建好" : @"失败", ended ? @"建好" : @"失败",
                    self.clientKind);
         }
     } @catch (NSException *ex) {
@@ -736,14 +774,19 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
     const double  f = MAX(1.0, _frequency);
     const double  interval = 1.0 / f;
 
-    // 按下/移动/抬起之间的间隔, 必须小于「点击间隔」才跑得满设定频率:
-    //   10/20/30/50 次每秒 -> 间隔 100/50/33/20ms, 6ms×2 完全够;
-    //   100 次每秒        -> 间隔只有 10ms, 6ms×2 会超时, 必须压到 ~2.5ms。
-    double phaseDelay = 0.006;
-    if (interval < 0.015) {
-        phaseDelay = MAX(0.0015, interval * 0.25);
-    }
-    const useconds_t phaseDelayUs = (useconds_t)(phaseDelay * 1e6);
+    // ★ 单次"按住"时长 (不是移动间隔, 现在序列里已经没有 Moved 了) ★
+    //   要同时满足两个目标:
+    //     a) 必须小于点击间隔, 否则定时器到期时上一次还没放开, 会拖垮设定频率;
+    //     b) 必须"够长", 让它看起来像真人短按 —— 真人短按在 50~100ms 量级,
+    //        而 app 的 UIScrollView(delaysContentTouches) 会把过短的按压判成误触
+    //        或拖动预备, 从而取消按钮的 touchUpInside。这正是「价格能点、抢购按钮
+    //        点不动」的原因。
+    //   取法: hold = min(点击间隔的 70%, 60ms), 下限 8ms。于是
+    //     10/s (100ms 间隔) -> hold 60ms   (真人短按量级, 舒适)
+    //     20/s ( 50ms 间隔) -> hold 35ms   (仍是可识别的一次按压, 且不超时)
+    const double idealHold = MIN(interval * 0.7, 0.060);
+    const double holdSec   = MAX(0.008, idealHold);
+    const useconds_t holdUs = (useconds_t)(holdSec * 1e6);
 
     _slot  = dispatch_semaphore_create(1);
     _queue = dispatch_queue_create("com.jdclicker.sb", DISPATCH_QUEUE_SERIAL);
@@ -758,12 +801,12 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
         if (!sself || !sself->_timer) return;
         if (dispatch_semaphore_wait(slot, DISPATCH_TIME_NOW) != 0) return;
         // HID 派发不要求主线程, 直接在当前队列做
-        [[ACTouchInjector shared] tapAtPoint:p phaseDelay:phaseDelayUs];
+        [[ACTouchInjector shared] tapAtPoint:p phaseDelay:holdUs];
         dispatch_semaphore_signal(slot);
     });
     dispatch_resume(_timer);
 
-    AC_LOG(@"开始连点: 位置=(%.0f, %.0f) 频率=%.0f/s 相位间隔=%ldus", p.x, p.y, f, (long)phaseDelayUs);
+    AC_LOG(@"开始连点: 位置=(%.0f, %.0f) 频率=%.0f/s 按住时长=%ldus (无移动事件)", p.x, p.y, f, (long)holdUs);
     if (self.onStateChange) self.onStateChange(YES);
     return YES;
 }
@@ -1529,18 +1572,22 @@ static UIWindowScene *ACAnyWindowScene(void)
         AC_LOG(@"悬浮球遮挡了点击点, 已自动移动到 (%.0f, %.0f)", safe.x, safe.y);
     }
 
-    // ★ 关键诊断: 检查点击点是不是被我们自己的悬浮层挡住了。
-    //   系统级 HID 事件是按坐标投递的, 而我们的窗口是全屏的、层级 3000。
-    //   如果这个坐标被自己的视图命中, 触摸就会被我们吃掉, 打不到京东。
+    // ★ 关键诊断: 检查点击点是不是被我们自己的悬浮层挡住了 ★
+    //   注意: 这里必须**先按"开始后"的真实状态**判断 —— 开始后菜单会收起、
+    //   球若重叠也会被挪走, 所以要用隐藏菜单之后的命中结果, 否则每次都误报。
+    _menu.hidden = YES;
     UIView *hit = [_window hitTest:_point withEvent:nil];
     if (hit) {
         AC_LOG(@"!! 点击点 (%.0f, %.0f) 被自己的悬浮层挡住了: %@",
                _point.x, _point.y, NSStringFromClass([hit class]));
-        AC_LOG(@"!! 触摸会打在这个视图上而不是京东 —— 请把准星移到没有被球/菜单覆盖的位置。");
+        AC_LOG(@"!! 触摸会打在这个视图上而不是京东 —— 请把准星移到没有被球覆盖的位置。");
     } else {
         AC_LOG(@"点击点 (%.0f, %.0f) 未被悬浮层命中 (hitTest=nil, 触摸可以穿过)",
                _point.x, _point.y);
     }
+
+    // 每轮开始都清零派发统计, 日志序号/耗时才能和屏幕上的秒杀倒计时对齐。
+    [[ACTouchInjector shared] resetDispatchStats];
 
     eng.point = _point;
     eng.frequency = [self currentFrequency];
