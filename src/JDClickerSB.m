@@ -467,8 +467,11 @@ static IOHIDEventRef ACCreateHIDEventWithFinger(CGPoint point, UITouchPhase phas
 
         if (_dispatchCount <= 4) {
             CGSize sz = ACScreenFixedSize();
-            AC_LOG(@"派发 #%ld: 点=(%.0f, %.0f) 按住=%ldus 手指id=%u 序列=下-抬 began/ended=%@/%@ client=%@",
+            AC_LOG(@"派发 #%ld: 点=(%.0f, %.0f) 归一化=(%.4f, %.4f) 屏=%.0fx%.0f 按住=%ldus 手指id=%u 序列=下-抬 began/ended=%@/%@ client=%@",
                    (long)_dispatchCount, point.x, point.y,
+                   sz.width > 0 ? point.x / sz.width : 0.0,
+                   sz.height > 0 ? point.y / sz.height : 0.0,
+                   sz.width, sz.height,
                    (long)d, fid,
                    began ? @"建好" : @"失败", ended ? @"建好" : @"失败",
                    self.clientKind);

@@ -31,7 +31,9 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = JDClickerSB
 
 JDClickerSB_FILES = JDClickerSB.m
-JDClickerSB_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-parameter
+# -Wno-unused-variable: 日志里为了打印归一化坐标/屏幕尺寸会声明 sz, 某些分支下
+#   用不到就会触发 -Werror 把整个构建打挂。诊断日志这类东西不该阻断构建。
+JDClickerSB_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-parameter -Wno-unused-variable
 JDClickerSB_FRAMEWORKS = UIKit Foundation QuartzCore CoreGraphics CoreFoundation
 
 include $(THEOS_MAKE_PATH)/tweak.mk
