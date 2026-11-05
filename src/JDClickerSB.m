@@ -838,10 +838,11 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
     const double holdSec   = idealHold;
     const useconds_t holdUs = (useconds_t)(holdSec * 1e6);
 
-    // 点击之间必须留的无触摸间隙。取 120ms: 足够让系统收尾使用会话、把焦点还给
-    // 用户手指; 又不会把整体节奏拖得太慢。于是每一轮 ≈ 160 + 120 = 280ms,
-    // 实际约 3~4 次/秒 —— 抢购这种"中一次就够"的用途完全够用, 且球随时能点。
-    const double idleGapSec = 0.120;
+    // 点击之间必须留的无触摸间隙。1.0.2049 从 120ms 压到 80ms:
+    //   120ms 时一轮 ≈ 280ms(约 3.5 次/秒), 确实偏保守。80ms 仍足够让系统收尾
+    //   触摸会话、把焦点还给用户手指(实测 60ms 以下才开始出现"停不下来"的迹象),
+    //   于是每轮 ≈ 160 + 80 = 240ms, 约 4.2 次/秒 —— 明显快一点, 且球依然随时可点。
+    const double idleGapSec = 0.080;
     const double cycleSec   = holdSec + idleGapSec;   // 一轮的真实时长
 
     // ★ 1.0.2044: 拟人化微抖动 ★
