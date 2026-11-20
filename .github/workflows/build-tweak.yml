@@ -26,7 +26,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15   # macOS 14 runner image 已于 2026-11-02 退役; 15/26 均为 arm64, 交叉编译 arm64+arm64e 无影响
 
     steps:
       - uses: actions/checkout@v4
