@@ -806,6 +806,15 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
     const double  f = MAX(1.0, _frequency);
     const double  interval = 1.0 / f;
 
+    // ★ 1.0.2050: 两个档位 = 两套策略 ★
+    //   10/s 档 = 稳妥模式: 按住 ≥160ms 越过 UIScrollView 的 delaysContentTouches 门槛,
+    //             每一下都能被"滚动视图里的按钮"识别; 实际约 4 次/秒。
+    //   20/s 档 = 高速模式: 短促点击(按住约 40ms), 实际约 20 次/秒, 专供抢购/抢券这类
+    //             固定底栏按钮 —— 底栏按钮不在滚动视图内, 不吃 160ms 延迟, 短点即触发,
+    //             单位时间点得越多越容易抢中。若个别按钮短点不灵, 切回 10/s 即可。
+    //   安全网: 高速档若球不好点, 用音量键物理停止(1.0.2048 已加)。
+    const BOOL fastMode = (f >= 15.0);
+
     // ★ 单次"按住"时长 —— 1.0.2047 起改为"优先保证能被识别" ★
     //   这是本项目最反直觉的一个结论, 必须写清楚:
     //
@@ -833,7 +842,7 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
     //   表现为"停不下来, 只能关屏幕"。这是必须修掉的死锁级问题。
     //   做法: 每次点击结束后强制等待一段"完全无触摸"的间隙, 确保系统看得到
     //   "手指抬起 -> 空白 -> 手指按下"的完整节奏, 焦点能回到用户手指。
-    const double minHoldToRegister = 0.160;      // 越过 delaysContentTouches 的门槛
+    const double minHoldToRegister = fastMode ? 0.006 : 0.160;  // 高速档只需短按
     const double idealHold = MAX(minHoldToRegister, MIN(interval * 0.8, 0.300));
     const double holdSec   = idealHold;
     const useconds_t holdUs = (useconds_t)(holdSec * 1e6);
@@ -842,7 +851,7 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
     //   120ms 时一轮 ≈ 280ms(约 3.5 次/秒), 确实偏保守。80ms 仍足够让系统收尾
     //   触摸会话、把焦点还给用户手指(实测 60ms 以下才开始出现"停不下来"的迹象),
     //   于是每轮 ≈ 160 + 80 = 240ms, 约 4.2 次/秒 —— 明显快一点, 且球依然随时可点。
-    const double idleGapSec = 0.080;
+    const double idleGapSec = fastMode ? 0.000 : 0.080;
     const double cycleSec   = holdSec + idleGapSec;   // 一轮的真实时长
 
     // ★ 1.0.2044: 拟人化微抖动 ★
@@ -907,9 +916,12 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
         [UIApplication sharedApplication].idleTimerDisabled = YES;
     });
 
-    AC_LOG(@"开始连点: 位置=(%.0f, %.0f)±1.5pt 按住时长=%ldus 间隙=%ldus 实际约 %.1f 次/秒",
+    AC_LOG(@"开始连点: 模式=%@ 位置=(%.0f, %.0f)±1.5pt 按住时长=%ldus 间隙=%ldus 实际约 %.1f 次/秒",
+           fastMode ? @"高速" : @"稳妥",
            p.x, p.y, (long)holdUs, (long)(idleGapSec * 1e6), 1.0 / tickSec);
-    AC_LOG(@"说明: 按住 ≥160ms 越过 UIScrollView 触摸延迟门槛; 每轮之间留 120ms 无触摸间隙, 保证悬浮球随时可点停止");
+    AC_LOG(@"说明: %@档 —— %@", fastMode ? @"高速" : @"稳妥",
+           fastMode ? @"短促点击, 约 20 次/秒, 适合抢购固定底栏按钮"
+                    : @"每下按住≥160ms 越过滚动视图延迟门槛, 约 4 次/秒, 最稳");
     if (self.onStateChange) self.onStateChange(YES);
     return YES;
 }
@@ -1291,9 +1303,9 @@ static UIWindowScene *ACAnyWindowScene(void)
         else AC_LOG(@"悬浮球已隐藏");
     }
 
-    // 有倒计时在跑时, 顺带刷新一下剩余秒数(2Hz, 几乎不耗电)
-    if (!_window.hidden && _autoStopSec > 0 && _autoStopDeadline > 0 &&
-        [ACClickEngine shared].running) {
+    // 运行中(且球可见)时按 2Hz 刷新界面 —— 球上会实时显示"已派发次数",
+    // 到点抢购时肉眼就能判断点击到底有没有发出去(数字在涨=在发; 不动=卡住)。
+    if (!_window.hidden && [ACClickEngine shared].running) {
         [self refreshUI];
     }
 
@@ -1374,10 +1386,10 @@ static UIWindowScene *ACAnyWindowScene(void)
     _startBtn.frame = CGRectMake(10, 56, w - 20, 40);
     [_menu addSubview:_startBtn];
 
-    // ★ 频率只留 10/s 和 20/s 两档 ★
-    //   20/s 在一些页面里会被页面自己的防抖/滚动判定吞掉, 但多数场景更快更顺手,
-    //   所以两档都留着让用户按场景切; 30/50/100 已移除 (基本点不动, 只有反作用)。
-    _freqCtrl = [[UISegmentedControl alloc] initWithItems:@[@"10/s", @"20/s"]];
+    // ★ 频率两档, 各对应一套策略(1.0.2050) ★
+    //   10/s = 稳妥档: 长按越过滚动视图门槛, 约 4 次/秒, 每下都点得中(推荐日常/滚动页按钮)。
+    //   20/s = 高速档: 短促点击, 约 20 次/秒, 专给抢购固定底栏按钮用, 抢中率更高。
+    _freqCtrl = [[UISegmentedControl alloc] initWithItems:@[@"稳妥 10/s", @"高速 20/s"]];
     _freqCtrl.frame = CGRectMake(10, 102, w - 20, 32);
     _freqCtrl.selectedSegmentIndex = _freqIndex;
     // 深色面板上必须显式把分段控件的文字设成白色, 默认黑字基本看不见。
@@ -1844,7 +1856,11 @@ static UIWindowScene *ACAnyWindowScene(void)
     _ball.layer.borderColor = (running
         ? [UIColor colorWithRed:1.0 green:0.94 blue:0.60 alpha:1.0]
         : [UIColor colorWithWhite:1.0 alpha:1.0]).CGColor;
-    _ballLabel.text = running ? @"停" : @"连点";
+    // 运行中在球上实时显示"已派发次数" —— 到点抢购时肉眼就能判断点击到底有没有发出去:
+    // 数字在涨 = 引擎在发(问题多半在京东侧: 按钮没出现/排队/验证码); 数字不动 = 派发队列卡住。
+    _ballLabel.text = running
+        ? [NSString stringWithFormat:@"%ld", (long)inj.dispatchCount]
+        : @"连点";
     // 运行中套一圈黄色脉冲光环 —— 满屏撒花时靠这圈扩散的光最容易定位
     [_ball setPulsing:running];
 
