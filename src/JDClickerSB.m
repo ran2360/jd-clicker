@@ -897,6 +897,16 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
     });
     dispatch_resume(_timer);
 
+    // ★ 1.0.2050 关键修复: 运行期间强制屏幕常亮 ★
+    //   合成 HID 触摸在 iOS 眼里不算「用户活动」, 不会重置自动锁屏的空闲计时器。
+    //   于是「设好频率 -> 手握手机等开抢」时, 屏幕会在自动锁定时间后变暗上锁,
+    //   到点那一下其实点在锁屏上 -> 表现为「总是到时间点就不生效」, 而手动抢时
+    //   手指一直碰屏幕不会锁, 所以手动反而抢得到。
+    //   SpringBoard 本身就是 UIApplication, 直接关掉它的空闲计时器即可; 停止时复原。
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [UIApplication sharedApplication].idleTimerDisabled = YES;
+    });
+
     AC_LOG(@"开始连点: 位置=(%.0f, %.0f)±1.5pt 按住时长=%ldus 间隙=%ldus 实际约 %.1f 次/秒",
            p.x, p.y, (long)holdUs, (long)(idleGapSec * 1e6), 1.0 / tickSec);
     AC_LOG(@"说明: 按住 ≥160ms 越过 UIScrollView 触摸延迟门槛; 每轮之间留 120ms 无触摸间隙, 保证悬浮球随时可点停止");
@@ -909,6 +919,10 @@ static ACFrontProbe ACProbeTargetFrontmost(BOOL verbose)
     if (!_timer) return;
     dispatch_source_cancel(_timer);
     _timer = nil; _queue = nil; _slot = nil;
+    // 停止连点后恢复系统的自动锁屏计时器
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [UIApplication sharedApplication].idleTimerDisabled = NO;
+    });
     AC_LOG(@"停止连点");
     if (self.onStateChange) self.onStateChange(NO);
 }
